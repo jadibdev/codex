@@ -55,13 +55,14 @@ use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_DELETE;
 use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
 use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_WRITE;
 use windows_sys::Win32::Storage::FileSystem::FILE_STANDARD_INFO;
-use windows_sys::Win32::Storage::FileSystem::FILE_SYNCHRONOUS_IO_NONALERT;
 use windows_sys::Win32::Storage::FileSystem::FILE_TRAVERSE;
 use windows_sys::Win32::Storage::FileSystem::FileDispositionInfo;
 use windows_sys::Win32::Storage::FileSystem::FileStandardInfo;
 use windows_sys::Win32::Storage::FileSystem::GetFileInformationByHandleEx;
 use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
 use windows_sys::Win32::Storage::FileSystem::SetFileInformationByHandle;
+
+const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x20;
 
 pub(crate) struct PlaceholderRollbackGuard {
     pub(crate) entries: Vec<(PathBuf, OwnedHandle)>,
@@ -631,7 +632,23 @@ pub(crate) fn prepare_elevated_spawn_context_for_permissions(
 
 #[cfg(test)]
 mod tests {
+    use super::DELETE;
+    use super::FILE_READ_ATTRIBUTES;
+    use super::FILE_SHARE_DELETE;
+    use super::FILE_SHARE_READ;
+    use super::FILE_SHARE_WRITE;
+    use super::FILE_SYNCHRONOUS_IO_NONALERT;
+    use super::FILE_TRAVERSE;
+    use super::HANDLE;
+    use super::PlaceholderRollbackGuard;
+    use super::SYNCHRONIZE;
     use super::SpawnPrepOptions;
+    use super::materialize_missing_write_target_placeholders;
+    use crate::no_reparse_dir::DirectoryOpenDisposition;
+    use crate::no_reparse_dir::open_directory_no_reparse;
+    use crate::no_reparse_dir::open_no_reparse;
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::AsRawHandle;
     use super::deny_root_capabilities_for_path;
     use super::legacy_session_capability_roots;
     use super::prepare_legacy_spawn_context;

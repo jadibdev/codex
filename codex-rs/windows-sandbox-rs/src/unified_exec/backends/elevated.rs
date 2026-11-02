@@ -180,7 +180,7 @@ pub(crate) async fn spawn_windows_sandbox_session_elevated_for_permission_profil
             permission_profile,
             workspace_roots,
         )?;
-    let elevated = prepare_elevated_spawn_context_for_permissions(
+    let mut elevated = prepare_elevated_spawn_context_for_permissions(
         permissions.clone(),
         codex_home,
         cwd,
