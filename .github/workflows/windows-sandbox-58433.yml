@@ -66,6 +66,14 @@ jobs:
           set -euo pipefail
           cargo fmt -p codex-windows-sandbox -- --check 2>&1 | tee "${RUNNER_TEMP}/logs/02-fmt.log"
 
+      # Lets a contributor without a local toolchain apply formatting with `git apply`.
+      - name: Export rustfmt patch
+        if: always()
+        run: |
+          cargo fmt -p codex-windows-sandbox || true
+          git diff -- windows-sandbox-rs > "${RUNNER_TEMP}/logs/rustfmt.patch"
+          git checkout -- windows-sandbox-rs
+
       - name: Build sandbox helper binaries
         run: |
           set -euo pipefail

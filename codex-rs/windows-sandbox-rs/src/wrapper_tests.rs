@@ -197,8 +197,11 @@ fn windows_wrapper_args_round_trip() {
 #[test]
 fn wrapper_materializes_and_commits_missing_write_placeholder() {
     let temp = tempfile::tempdir().expect("tempdir");
-    let command_cwd =
-        AbsolutePathBuf::from_absolute_path(temp.path()).expect("absolute command cwd");
+    // The target must sit outside every writable root: inside one, the child
+    // can create it itself and no placeholder is made.
+    let work = temp.path().join("work");
+    std::fs::create_dir_all(&work).expect("create work dir");
+    let command_cwd = AbsolutePathBuf::from_absolute_path(&work).expect("absolute command cwd");
     let missing_target = temp.path().join("missing_leaf.txt");
     let missing_target_abs =
         AbsolutePathBuf::from_absolute_path(&missing_target).expect("absolute target");
@@ -208,8 +211,9 @@ fn wrapper_materializes_and_commits_missing_write_placeholder() {
     let permission_profile = PermissionProfile::workspace_write_with(
         &[missing_target_abs],
         codex_protocol::permissions::NetworkSandboxPolicy::Restricted,
-        /*exclude_tmpdir_env_var*/ false,
-        /*exclude_slash_tmp*/ false,
+        // tempdir() lives under TEMP; keep TEMP out of the writable roots.
+        /*exclude_tmpdir_env_var*/ true,
+        /*exclude_slash_tmp*/ true,
     );
 
     let args = create_windows_sandbox_command_args_for_permission_profile(

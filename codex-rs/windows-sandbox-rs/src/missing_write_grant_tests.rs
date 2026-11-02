@@ -227,3 +227,28 @@ fn test_missing_directory_pinning_58118() {
     assert!(missing_dir.is_file(), "grant must be materialized as a file");
     assert_eq!(fs::metadata(&missing_dir).unwrap().len(), 0);
 }
+
+#[test]
+fn test_spawn_failure_rolls_back_placeholder() {
+    let fx = Fixture::new();
+    let outside = fx.root.join("outside");
+    fs::create_dir_all(&outside).expect("create outside dir");
+    let target = outside.join("never-written.txt");
+    let profile = fx.profile_granting(&[&target]);
+
+    let workspace_roots = vec![AbsolutePathBuf::from_absolute_path(&fx.cwd).unwrap()];
+    let missing_program = fx.root.join("no-such-program.exe");
+    let result = run_windows_sandbox_capture(
+        &profile,
+        workspace_roots.as_slice(),
+        &fx.codex_home,
+        vec![missing_program.display().to_string()],
+        &fx.cwd,
+        HashMap::new(),
+        Some(30_000),
+        None,
+    );
+
+    assert!(result.is_err(), "spawning a missing program must fail");
+    assert!(!target.exists(), "placeholder must be rolled back when spawn fails");
+}

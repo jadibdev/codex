@@ -45,9 +45,11 @@ use crate::no_reparse_dir::validate_local_directory_path;
 use crate::path_normalization::canonical_path_key;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::AsRawHandle;
+use std::os::windows::io::FromRawHandle;
 use std::os::windows::io::OwnedHandle;
 use windows_sys::Win32::Foundation::CloseHandle;
 use windows_sys::Win32::Foundation::HANDLE;
+use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
 use windows_sys::Win32::Storage::FileSystem::DELETE;
 use windows_sys::Win32::Storage::FileSystem::FILE_DISPOSITION_INFO;
 use windows_sys::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES;
@@ -59,14 +61,23 @@ use windows_sys::Win32::Storage::FileSystem::FILE_TRAVERSE;
 use windows_sys::Win32::Storage::FileSystem::FileDispositionInfo;
 use windows_sys::Win32::Storage::FileSystem::FileStandardInfo;
 use windows_sys::Win32::Storage::FileSystem::GetFileInformationByHandleEx;
+use windows_sys::Win32::Storage::FileSystem::ReOpenFile;
 use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
 use windows_sys::Win32::Storage::FileSystem::SetFileInformationByHandle;
 
+const FILE_CREATE: u32 = 2;
+const FILE_NON_DIRECTORY_FILE: u32 = 0x40;
 const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x20;
 
+/// Placeholders created for this spawn, deleted on drop unless committed.
+///
+/// Each handle holds only `FILE_READ_ATTRIBUTES | SYNCHRONIZE`, which do not
+/// participate in sharing checks, so the sandboxed child can open the file with
+/// any share mode while the guard is alive. Rollback reopens the same file
+/// object with `DELETE` instead of looking the path up again.
 pub(crate) struct PlaceholderRollbackGuard {
-    pub(crate) entries: Vec<(PathBuf, OwnedHandle)>,
-    pub(crate) committed: bool,
+    entries: Vec<(PathBuf, OwnedHandle)>,
+    committed: bool,
 }
 
 impl PlaceholderRollbackGuard {
@@ -77,6 +88,14 @@ impl PlaceholderRollbackGuard {
         }
     }
 
+    pub(crate) fn push(&mut self, path: PathBuf, handle: OwnedHandle) {
+        self.entries.push((path, handle));
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
     pub(crate) fn commit(&mut self) {
         self.committed = true;
         self.entries.clear();
@@ -85,43 +104,83 @@ impl PlaceholderRollbackGuard {
 
 impl Drop for PlaceholderRollbackGuard {
     fn drop(&mut self) {
-        if !self.committed {
-            for (path, handle) in self.entries.iter().rev() {
-                let mut file_info = std::mem::MaybeUninit::<FILE_STANDARD_INFO>::uninit();
-                let ok = unsafe {
-                    GetFileInformationByHandleEx(
-                        handle.as_raw_handle() as HANDLE,
-                        FileStandardInfo,
-                        file_info.as_mut_ptr().cast(),
-                        std::mem::size_of::<FILE_STANDARD_INFO>() as u32,
-                    )
-                };
-                if ok != 0 {
-                    let file_info = unsafe { file_info.assume_init() };
-                    if file_info.EndOfFile == 0 {
-                        let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
-                        let _ = unsafe {
-                            SetFileInformationByHandle(
-                                handle.as_raw_handle() as HANDLE,
-                                FileDispositionInfo,
-                                (&raw const disposition).cast(),
-                                std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
-                            )
-                        };
-                    } else {
-                        crate::logging::log_note(
-                            &format!(
-                                "placeholder rollback skipped for {}: file non-empty (size={})",
-                                path.display(),
-                                file_info.EndOfFile
-                            ),
-                            None,
-                        );
-                    }
-                }
+        if self.committed {
+            return;
+        }
+        for (path, handle) in self.entries.iter().rev() {
+            if let Err(reason) = delete_placeholder_if_empty(handle) {
+                crate::logging::log_note(
+                    &format!("placeholder rollback skipped for {}: {reason}", path.display()),
+                    None,
+                );
             }
         }
     }
+}
+
+/// Creates a 0-byte placeholder named `file_name` inside `parent_handle`,
+/// failing if anything already exists there.
+pub(crate) fn create_placeholder_file(
+    parent_handle: &OwnedHandle,
+    file_name: &std::ffi::OsStr,
+) -> Result<OwnedHandle> {
+    let mut leaf_utf16: Vec<u16> = file_name.encode_wide().chain(Some(0)).collect();
+    open_no_reparse(
+        parent_handle.as_raw_handle() as HANDLE,
+        &mut leaf_utf16,
+        FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        FILE_CREATE,
+        FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
+    )
+}
+
+fn delete_placeholder_if_empty(handle: &OwnedHandle) -> std::result::Result<(), String> {
+    // Fails with a sharing violation while another opener holds the file
+    // without FILE_SHARE_DELETE; keeping the file is the safe outcome then.
+    let raw = unsafe {
+        ReOpenFile(
+            handle.as_raw_handle() as HANDLE,
+            DELETE | FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            0,
+        )
+    };
+    if raw == INVALID_HANDLE_VALUE {
+        return Err(format!("reopen for delete failed: {}", std::io::Error::last_os_error()));
+    }
+    let delete_handle = unsafe { OwnedHandle::from_raw_handle(raw as _) };
+
+    let mut file_info = std::mem::MaybeUninit::<FILE_STANDARD_INFO>::uninit();
+    let ok = unsafe {
+        GetFileInformationByHandleEx(
+            delete_handle.as_raw_handle() as HANDLE,
+            FileStandardInfo,
+            file_info.as_mut_ptr().cast(),
+            std::mem::size_of::<FILE_STANDARD_INFO>() as u32,
+        )
+    };
+    if ok == 0 {
+        return Err(format!("size query failed: {}", std::io::Error::last_os_error()));
+    }
+    let file_info = unsafe { file_info.assume_init() };
+    if file_info.EndOfFile != 0 {
+        return Err(format!("file non-empty (size={})", file_info.EndOfFile));
+    }
+
+    let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+    let ok = unsafe {
+        SetFileInformationByHandle(
+            delete_handle.as_raw_handle() as HANDLE,
+            FileDispositionInfo,
+            (&raw const disposition).cast(),
+            std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+        )
+    };
+    if ok == 0 {
+        return Err(format!("delete failed: {}", std::io::Error::last_os_error()));
+    }
+    Ok(())
 }
 
 pub(crate) struct SpawnContext {
@@ -218,19 +277,9 @@ pub(crate) fn materialize_missing_write_target_placeholders(
             }
         };
 
-        let mut leaf_utf16: Vec<u16> = file_name.encode_wide().chain(Some(0)).collect();
-        const FILE_CREATE: u32 = 2;
-        const FILE_NON_DIRECTORY_FILE: u32 = 0x40;
-        match open_no_reparse(
-            parent_handle.as_raw_handle() as HANDLE,
-            &mut leaf_utf16,
-            DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            FILE_CREATE,
-            FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
-        ) {
+        match create_placeholder_file(&parent_handle, file_name) {
             Ok(handle) => {
-                guard.entries.push((candidate, handle));
+                guard.push(candidate, handle);
             }
             Err(err) => {
                 crate::logging::log_note(
@@ -634,23 +683,18 @@ pub(crate) fn prepare_elevated_spawn_context_for_permissions(
 
 #[cfg(test)]
 mod tests {
-    use super::DELETE;
     use super::FILE_READ_ATTRIBUTES;
-    use super::FILE_SHARE_DELETE;
     use super::FILE_SHARE_READ;
     use super::FILE_SHARE_WRITE;
-    use super::FILE_SYNCHRONOUS_IO_NONALERT;
     use super::FILE_TRAVERSE;
-    use super::HANDLE;
     use super::PlaceholderRollbackGuard;
-    use super::SYNCHRONIZE;
     use super::SpawnPrepOptions;
+    use super::create_placeholder_file;
     use super::materialize_missing_write_target_placeholders;
     use crate::no_reparse_dir::DirectoryOpenDisposition;
     use crate::no_reparse_dir::open_directory_no_reparse;
-    use crate::no_reparse_dir::open_no_reparse;
-    use std::os::windows::ffi::OsStrExt;
-    use std::os::windows::io::AsRawHandle;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::path::PathBuf;
     use super::deny_root_capabilities_for_path;
     use super::legacy_session_capability_roots;
     use super::prepare_legacy_spawn_context;
@@ -922,123 +966,92 @@ mod tests {
         assert!(!roots.contains(&dunce::canonicalize(&sandbox_root).expect("sandbox root")));
     }
 
-    #[test]
-    fn placeholder_guard_rollback_deletes_zero_byte_file_on_drop() {
-        let tmp = TempDir::new().expect("tempdir");
-        let file_path = tmp.path().join("placeholder.txt");
-
+    /// Creates `name` in `dir` the way materialization does and arms a guard for it.
+    fn guarded_placeholder(dir: &Path, name: &str) -> (PathBuf, PlaceholderRollbackGuard) {
         let parent_handle = open_directory_no_reparse(
-            tmp.path(),
+            dir,
             FILE_TRAVERSE | FILE_READ_ATTRIBUTES,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
             DirectoryOpenDisposition::OpenExisting,
         )
         .expect("open parent");
-
-        let mut leaf_utf16: Vec<u16> = std::ffi::OsStr::new("placeholder.txt")
-            .encode_wide()
-            .chain(Some(0))
-            .collect();
-        const FILE_CREATE: u32 = 2;
-        const FILE_NON_DIRECTORY_FILE: u32 = 0x40;
-        let file_handle = open_no_reparse(
-            parent_handle.as_raw_handle() as HANDLE,
-            &mut leaf_utf16,
-            DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            FILE_CREATE,
-            FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
-        )
-        .expect("create placeholder");
-
-        assert!(file_path.exists());
-
+        let handle = create_placeholder_file(&parent_handle, std::ffi::OsStr::new(name))
+            .expect("create placeholder");
+        let path = dir.join(name);
         let mut guard = PlaceholderRollbackGuard::empty();
-        guard.entries.push((file_path.clone(), file_handle));
-        // Drop guard uncommitted -> file size is 0, so it must be deleted!
+        guard.push(path.clone(), handle);
+        (path, guard)
+    }
+
+    fn open_without_share_delete(path: &Path) -> std::fs::File {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(path)
+            .expect("open without FILE_SHARE_DELETE")
+    }
+
+    #[test]
+    fn placeholder_guard_rollback_deletes_zero_byte_file_on_drop() {
+        let tmp = TempDir::new().expect("tempdir");
+        let (path, guard) = guarded_placeholder(tmp.path(), "placeholder.txt");
+        assert_eq!(std::fs::metadata(&path).expect("placeholder").len(), 0);
+
         drop(guard);
 
-        assert!(!file_path.exists(), "uncommitted 0-byte placeholder must be deleted on drop");
+        assert!(!path.exists(), "uncommitted 0-byte placeholder must be deleted");
     }
 
     #[test]
     fn placeholder_guard_rollback_preserves_non_empty_file_on_drop() {
         let tmp = TempDir::new().expect("tempdir");
-        let file_path = tmp.path().join("placeholder_with_data.txt");
+        let (path, guard) = guarded_placeholder(tmp.path(), "placeholder_with_data.txt");
+        std::fs::write(&path, "important user data").expect("write user data");
 
-        let parent_handle = open_directory_no_reparse(
-            tmp.path(),
-            FILE_TRAVERSE | FILE_READ_ATTRIBUTES,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-            DirectoryOpenDisposition::OpenExisting,
-        )
-        .expect("open parent");
-
-        let mut leaf_utf16: Vec<u16> = std::ffi::OsStr::new("placeholder_with_data.txt")
-            .encode_wide()
-            .chain(Some(0))
-            .collect();
-        const FILE_CREATE: u32 = 2;
-        const FILE_NON_DIRECTORY_FILE: u32 = 0x40;
-        let file_handle = open_no_reparse(
-            parent_handle.as_raw_handle() as HANDLE,
-            &mut leaf_utf16,
-            DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            FILE_CREATE,
-            FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
-        )
-        .expect("create placeholder");
-
-        // Write user data to file
-        std::fs::write(&file_path, "important user data").expect("write user data");
-        assert_eq!(std::fs::metadata(&file_path).unwrap().len(), 19);
-
-        let mut guard = PlaceholderRollbackGuard::empty();
-        guard.entries.push((file_path.clone(), file_handle));
-        // Drop guard uncommitted -> file size > 0, so it must be preserved!
         drop(guard);
 
-        assert!(file_path.exists(), "non-empty placeholder must NOT be deleted on drop");
-        assert_eq!(std::fs::read_to_string(&file_path).unwrap(), "important user data");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("file kept"),
+            "important user data"
+        );
     }
 
     #[test]
     fn placeholder_guard_commit_preserves_file_and_closes_handles() {
         let tmp = TempDir::new().expect("tempdir");
-        let file_path = tmp.path().join("committed.txt");
+        let (path, mut guard) = guarded_placeholder(tmp.path(), "committed.txt");
 
-        let parent_handle = open_directory_no_reparse(
-            tmp.path(),
-            FILE_TRAVERSE | FILE_READ_ATTRIBUTES,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-            DirectoryOpenDisposition::OpenExisting,
-        )
-        .expect("open parent");
-
-        let mut leaf_utf16: Vec<u16> = std::ffi::OsStr::new("committed.txt")
-            .encode_wide()
-            .chain(Some(0))
-            .collect();
-        const FILE_CREATE: u32 = 2;
-        const FILE_NON_DIRECTORY_FILE: u32 = 0x40;
-        let file_handle = open_no_reparse(
-            parent_handle.as_raw_handle() as HANDLE,
-            &mut leaf_utf16,
-            DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            FILE_CREATE,
-            FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
-        )
-        .expect("create placeholder");
-
-        let mut guard = PlaceholderRollbackGuard::empty();
-        guard.entries.push((file_path.clone(), file_handle));
         guard.commit();
-        assert!(guard.entries.is_empty(), "commit must close handles");
+        assert!(guard.is_empty(), "commit must close handles");
         drop(guard);
 
-        assert!(file_path.exists(), "committed placeholder must stay on disk");
+        assert!(path.exists(), "committed placeholder must stay on disk");
+    }
+
+    #[test]
+    fn placeholder_guard_does_not_block_openers_without_share_delete() {
+        // Many writers (MSVC CRT fopen, Office) omit FILE_SHARE_DELETE. The
+        // guard's handle must not make them fail with a sharing violation.
+        let tmp = TempDir::new().expect("tempdir");
+        let (path, guard) = guarded_placeholder(tmp.path(), "shared.txt");
+
+        let file = open_without_share_delete(&path);
+        drop(file);
+        drop(guard);
+
+        assert!(!path.exists(), "still-empty placeholder is rolled back");
+    }
+
+    #[test]
+    fn placeholder_guard_keeps_file_another_process_holds_open() {
+        let tmp = TempDir::new().expect("tempdir");
+        let (path, guard) = guarded_placeholder(tmp.path(), "held.txt");
+
+        let file = open_without_share_delete(&path);
+        drop(guard);
+
+        assert!(path.exists(), "rollback must not delete a file in use");
+        drop(file);
     }
 
     #[test]
@@ -1078,7 +1091,7 @@ mod tests {
             ResolvedWindowsSandboxPermissions::try_from_permission_profile(&profile).unwrap();
 
         let guard = materialize_missing_write_target_placeholders(&permissions, &cwd, &codex_home, &[]);
-        assert!(guard.entries.is_empty(), "missing parent directory must be skipped without creating parent");
+        assert!(guard.is_empty(), "missing parent directory must be skipped without creating parent");
         assert!(!non_existent_parent.exists(), "parent directory must not be created");
         assert!(!target.exists(), "target must not be created");
     }
@@ -1120,7 +1133,7 @@ mod tests {
             ResolvedWindowsSandboxPermissions::try_from_permission_profile(&profile).unwrap();
 
         let guard = materialize_missing_write_target_placeholders(&permissions, &cwd, &codex_home, &[]);
-        assert!(guard.entries.is_empty(), "existing file must not be added to rollback guard");
+        assert!(guard.is_empty(), "existing file must not be added to rollback guard");
         assert_eq!(std::fs::read_to_string(&existing_file).unwrap(), "existing file content");
     }
 }
