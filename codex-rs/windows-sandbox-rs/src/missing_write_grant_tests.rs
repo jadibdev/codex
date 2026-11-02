@@ -142,7 +142,12 @@ fn test_end_to_end_missing_write_grant_reproduction_issue_58433() {
         "echo hello from sandbox> \"%TARGET%\"\r\nif exist \"%TARGET%\" exit /b 0\r\nexit /b 1\r\n",
         &[("TARGET", &brief_docx)],
     );
-    assert_eq!(result.exit_code, 0, "approved write must succeed: {}", output(&result));
+    assert_eq!(
+        result.exit_code,
+        0,
+        "approved write must succeed: {}",
+        output(&result)
+    );
     let content = fs::read_to_string(&brief_docx).expect("read brief.docx");
     assert!(content.contains("hello from sandbox"), "content: {content}");
 
@@ -154,8 +159,16 @@ fn test_end_to_end_missing_write_grant_reproduction_issue_58433() {
         "echo evil> \"%TARGET%\"\r\nif exist \"%TARGET%\" exit /b 0\r\nexit /b 1\r\n",
         &[("TARGET", &forbidden_file)],
     );
-    assert_ne!(result.exit_code, 0, "sibling write must fail: {}", output(&result));
-    assert!(!forbidden_file.exists(), "forbidden.txt must not be created");
+    assert_ne!(
+        result.exit_code,
+        0,
+        "sibling write must fail: {}",
+        output(&result)
+    );
+    assert!(
+        !forbidden_file.exists(),
+        "forbidden.txt must not be created"
+    );
 }
 
 #[test]
@@ -176,8 +189,16 @@ fn test_write_pattern_compatibility_matrix() {
         "copy /Y \"%SOURCE%\" \"%TARGET%\" >nul\r\nexit /b %ERRORLEVEL%\r\n",
         &[("SOURCE", &source_file), ("TARGET", &target_file)],
     );
-    assert_eq!(result.exit_code, 0, "copy-overwrite must succeed: {}", output(&result));
-    assert_eq!(fs::read_to_string(&target_file).unwrap().trim(), "source content");
+    assert_eq!(
+        result.exit_code,
+        0,
+        "copy-overwrite must succeed: {}",
+        output(&result)
+    );
+    assert_eq!(
+        fs::read_to_string(&target_file).unwrap().trim(),
+        "source content"
+    );
 
     // Row 3: temp-file + rename needs a sibling create in the ungranted parent.
     let result = fx.run_script(
@@ -186,7 +207,12 @@ fn test_write_pattern_compatibility_matrix() {
         "echo tmp> \"%SIBLING%\"\r\nif exist \"%SIBLING%\" exit /b 0\r\nexit /b 1\r\n",
         &[("SIBLING", &sibling_tmp)],
     );
-    assert_ne!(result.exit_code, 0, "sibling create must fail: {}", output(&result));
+    assert_ne!(
+        result.exit_code,
+        0,
+        "sibling create must fail: {}",
+        output(&result)
+    );
     assert!(!sibling_tmp.exists(), "sibling.tmp must not be created");
 
     // Row 4, within one command: delete succeeds (DELETE is on the file ACE),
@@ -204,7 +230,12 @@ fn test_write_pattern_compatibility_matrix() {
         ),
         &[("TARGET", &target_file)],
     );
-    assert_eq!(result.exit_code, 1, "delete ok, recreate denied: {}", output(&result));
+    assert_eq!(
+        result.exit_code,
+        1,
+        "delete ok, recreate denied: {}",
+        output(&result)
+    );
     assert!(!target_file.exists(), "target must not be recreated");
 }
 
@@ -224,7 +255,10 @@ fn test_missing_directory_pinning_58118() {
         &[("TARGET", &missing_dir)],
     );
     assert_ne!(result.exit_code, 0, "mkdir must fail: {}", output(&result));
-    assert!(missing_dir.is_file(), "grant must be materialized as a file");
+    assert!(
+        missing_dir.is_file(),
+        "grant must be materialized as a file"
+    );
     assert_eq!(fs::metadata(&missing_dir).unwrap().len(), 0);
 }
 
@@ -250,5 +284,8 @@ fn test_spawn_failure_rolls_back_placeholder() {
     );
 
     assert!(result.is_err(), "spawning a missing program must fail");
-    assert!(!target.exists(), "placeholder must be rolled back when spawn fails");
+    assert!(
+        !target.exists(),
+        "placeholder must be rolled back when spawn fails"
+    );
 }

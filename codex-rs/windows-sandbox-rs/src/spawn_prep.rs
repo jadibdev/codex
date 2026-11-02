@@ -17,6 +17,11 @@ use crate::env::normalize_null_device_env;
 use crate::identity::SandboxCreds;
 use crate::identity::require_logon_sandbox_creds;
 use crate::logging::log_start;
+use crate::no_reparse_dir::DirectoryOpenDisposition;
+use crate::no_reparse_dir::open_directory_no_reparse;
+use crate::no_reparse_dir::open_no_reparse;
+use crate::no_reparse_dir::validate_local_directory_path;
+use crate::path_normalization::canonical_path_key;
 use crate::path_normalization::canonicalize_path;
 use crate::resolved_permissions::ResolvedWindowsSandboxPermissions;
 use crate::sandbox_utils::ensure_codex_home_exists;
@@ -36,17 +41,12 @@ use codex_protocol::models::PermissionProfile;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::path::Path;
-use std::path::PathBuf;
-use crate::no_reparse_dir::DirectoryOpenDisposition;
-use crate::no_reparse_dir::open_directory_no_reparse;
-use crate::no_reparse_dir::open_no_reparse;
-use crate::no_reparse_dir::validate_local_directory_path;
-use crate::path_normalization::canonical_path_key;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::AsRawHandle;
 use std::os::windows::io::FromRawHandle;
 use std::os::windows::io::OwnedHandle;
+use std::path::Path;
+use std::path::PathBuf;
 use windows_sys::Win32::Foundation::CloseHandle;
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
@@ -92,6 +92,7 @@ impl PlaceholderRollbackGuard {
         self.entries.push((path, handle));
     }
 
+    #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -110,7 +111,10 @@ impl Drop for PlaceholderRollbackGuard {
         for (path, handle) in self.entries.iter().rev() {
             if let Err(reason) = delete_placeholder_if_empty(handle) {
                 crate::logging::log_note(
-                    &format!("placeholder rollback skipped for {}: {reason}", path.display()),
+                    &format!(
+                        "placeholder rollback skipped for {}: {reason}",
+                        path.display()
+                    ),
                     None,
                 );
             }
@@ -147,7 +151,10 @@ fn delete_placeholder_if_empty(handle: &OwnedHandle) -> std::result::Result<(), 
         )
     };
     if raw == INVALID_HANDLE_VALUE {
-        return Err(format!("reopen for delete failed: {}", std::io::Error::last_os_error()));
+        return Err(format!(
+            "reopen for delete failed: {}",
+            std::io::Error::last_os_error()
+        ));
     }
     let delete_handle = unsafe { OwnedHandle::from_raw_handle(raw as _) };
 
@@ -161,7 +168,10 @@ fn delete_placeholder_if_empty(handle: &OwnedHandle) -> std::result::Result<(), 
         )
     };
     if ok == 0 {
-        return Err(format!("size query failed: {}", std::io::Error::last_os_error()));
+        return Err(format!(
+            "size query failed: {}",
+            std::io::Error::last_os_error()
+        ));
     }
     let file_info = unsafe { file_info.assume_init() };
     if file_info.EndOfFile != 0 {
@@ -178,7 +188,10 @@ fn delete_placeholder_if_empty(handle: &OwnedHandle) -> std::result::Result<(), 
         )
     };
     if ok == 0 {
-        return Err(format!("delete failed: {}", std::io::Error::last_os_error()));
+        return Err(format!(
+            "delete failed: {}",
+            std::io::Error::last_os_error()
+        ));
     }
     Ok(())
 }
@@ -690,25 +703,25 @@ mod tests {
     use super::PlaceholderRollbackGuard;
     use super::SpawnPrepOptions;
     use super::create_placeholder_file;
-    use super::materialize_missing_write_target_placeholders;
-    use crate::no_reparse_dir::DirectoryOpenDisposition;
-    use crate::no_reparse_dir::open_directory_no_reparse;
-    use std::os::windows::fs::OpenOptionsExt;
-    use std::path::PathBuf;
     use super::deny_root_capabilities_for_path;
     use super::legacy_session_capability_roots;
+    use super::materialize_missing_write_target_placeholders;
     use super::prepare_legacy_spawn_context;
     use super::prepare_spawn_context_common;
     use super::root_capability_sids;
     use crate::cap::load_or_create_cap_sids;
     use crate::cap::workspace_write_cap_sid_for_root;
+    use crate::no_reparse_dir::DirectoryOpenDisposition;
+    use crate::no_reparse_dir::open_directory_no_reparse;
     use crate::resolved_permissions::ResolvedWindowsSandboxPermissions;
     use codex_protocol::models::PermissionProfile;
     use codex_protocol::permissions::NetworkSandboxPolicy;
     use codex_utils_absolute_path::AbsolutePathBuf;
     use pretty_assertions::assert_eq;
     use std::collections::HashMap;
+    use std::os::windows::fs::OpenOptionsExt;
     use std::path::Path;
+    use std::path::PathBuf;
     use tempfile::TempDir;
 
     fn workspace_profile(
@@ -999,7 +1012,10 @@ mod tests {
 
         drop(guard);
 
-        assert!(!path.exists(), "uncommitted 0-byte placeholder must be deleted");
+        assert!(
+            !path.exists(),
+            "uncommitted 0-byte placeholder must be deleted"
+        );
     }
 
     #[test]
@@ -1076,9 +1092,7 @@ mod tests {
                     ),
                     codex_protocol::permissions::FileSystemSandboxEntry::new(
                         codex_protocol::permissions::FileSystemPath::Path {
-                            path: AbsolutePathBuf::from_absolute_path(&target)
-                                .unwrap()
-                                .into(),
+                            path: AbsolutePathBuf::from_absolute_path(&target).unwrap().into(),
                         },
                         codex_protocol::permissions::FileSystemAccessMode::Write,
                     ),
@@ -1090,9 +1104,16 @@ mod tests {
         let permissions =
             ResolvedWindowsSandboxPermissions::try_from_permission_profile(&profile).unwrap();
 
-        let guard = materialize_missing_write_target_placeholders(&permissions, &cwd, &codex_home, &[]);
-        assert!(guard.is_empty(), "missing parent directory must be skipped without creating parent");
-        assert!(!non_existent_parent.exists(), "parent directory must not be created");
+        let guard =
+            materialize_missing_write_target_placeholders(&permissions, &cwd, &codex_home, &[]);
+        assert!(
+            guard.is_empty(),
+            "missing parent directory must be skipped without creating parent"
+        );
+        assert!(
+            !non_existent_parent.exists(),
+            "parent directory must not be created"
+        );
         assert!(!target.exists(), "target must not be created");
     }
 
@@ -1132,8 +1153,15 @@ mod tests {
         let permissions =
             ResolvedWindowsSandboxPermissions::try_from_permission_profile(&profile).unwrap();
 
-        let guard = materialize_missing_write_target_placeholders(&permissions, &cwd, &codex_home, &[]);
-        assert!(guard.is_empty(), "existing file must not be added to rollback guard");
-        assert_eq!(std::fs::read_to_string(&existing_file).unwrap(), "existing file content");
+        let guard =
+            materialize_missing_write_target_placeholders(&permissions, &cwd, &codex_home, &[]);
+        assert!(
+            guard.is_empty(),
+            "existing file must not be added to rollback guard"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&existing_file).unwrap(),
+            "existing file content"
+        );
     }
 }

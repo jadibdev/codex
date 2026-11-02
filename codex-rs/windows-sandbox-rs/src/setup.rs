@@ -1499,7 +1499,8 @@ pub(crate) fn is_allowed_write_target_path_with_user_profile(
             return false;
         }
     }
-    let sensitive_filtered = filter_sensitive_write_roots(vec![candidate.to_path_buf()], codex_home);
+    let sensitive_filtered =
+        filter_sensitive_write_roots(vec![candidate.to_path_buf()], codex_home);
     !sensitive_filtered.is_empty()
 }
 

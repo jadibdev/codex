@@ -223,7 +223,10 @@ impl ResolvedWindowsSandboxPermissions {
                 continue;
             }
             // Enforce policy write permission
-            if !self.file_system.can_write_local_path_with_cwd(&candidate, cwd) {
+            if !self
+                .file_system
+                .can_write_local_path_with_cwd(&candidate, cwd)
+            {
                 continue;
             }
             // The child can already create it, as a file or a directory, so a
@@ -767,9 +770,7 @@ mod tests {
             ),
             FileSystemSandboxEntry::new(
                 FileSystemPath::Path {
-                    path: AbsolutePathBuf::from_absolute_path(&target)
-                        .unwrap()
-                        .into(),
+                    path: AbsolutePathBuf::from_absolute_path(&target).unwrap().into(),
                 },
                 FileSystemAccessMode::Write,
             ),
@@ -797,12 +798,12 @@ mod tests {
             ),
             FileSystemSandboxEntry {
                 path: FileSystemPath::Path {
-                    path: AbsolutePathBuf::from_absolute_path(&target)
-                        .unwrap()
-                        .into(),
+                    path: AbsolutePathBuf::from_absolute_path(&target).unwrap().into(),
                 },
                 access: FileSystemAccessMode::Write,
-                missing_path_behavior: Some(codex_protocol::permissions::FileSystemSandboxEntryMissingPathBehavior::Skip),
+                missing_path_behavior: Some(
+                    codex_protocol::permissions::FileSystemSandboxEntryMissingPathBehavior::Skip,
+                ),
             },
         ]);
         let permissions =
@@ -846,7 +847,10 @@ mod tests {
         let permissions =
             ResolvedWindowsSandboxPermissions::try_from_permission_profile(&profile).unwrap();
         let candidates = permissions.explicit_missing_write_target_candidates(&cwd);
-        assert!(candidates.is_empty(), "directory root with descendants must be excluded");
+        assert!(
+            candidates.is_empty(),
+            "directory root with descendants must be excluded"
+        );
     }
 
     #[test]
@@ -866,9 +870,7 @@ mod tests {
             ),
             FileSystemSandboxEntry::new(
                 FileSystemPath::Path {
-                    path: AbsolutePathBuf::from_absolute_path(&target)
-                        .unwrap()
-                        .into(),
+                    path: AbsolutePathBuf::from_absolute_path(&target).unwrap().into(),
                 },
                 FileSystemAccessMode::Write,
             ),
@@ -882,7 +884,10 @@ mod tests {
         let permissions =
             ResolvedWindowsSandboxPermissions::try_from_permission_profile(&profile).unwrap();
         let candidates = permissions.explicit_missing_write_target_candidates(&cwd);
-        assert!(candidates.is_empty(), "deny glob matching file must be excluded");
+        assert!(
+            candidates.is_empty(),
+            "deny glob matching file must be excluded"
+        );
     }
 
     #[test]
@@ -909,7 +914,9 @@ mod tests {
             ),
             FileSystemSandboxEntry::new(
                 FileSystemPath::Path {
-                    path: AbsolutePathBuf::from_absolute_path(&out_dir).unwrap().into(),
+                    path: AbsolutePathBuf::from_absolute_path(&out_dir)
+                        .unwrap()
+                        .into(),
                 },
                 FileSystemAccessMode::Write,
             ),
@@ -917,6 +924,9 @@ mod tests {
         let permissions =
             ResolvedWindowsSandboxPermissions::try_from_permission_profile(&profile).unwrap();
         let candidates = permissions.explicit_missing_write_target_candidates(&cwd);
-        assert!(candidates.is_empty(), "creatable path must not get a placeholder");
+        assert!(
+            candidates.is_empty(),
+            "creatable path must not get a placeholder"
+        );
     }
 }

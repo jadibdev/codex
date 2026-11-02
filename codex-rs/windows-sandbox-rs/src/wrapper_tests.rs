@@ -212,7 +212,8 @@ fn wrapper_materializes_and_commits_missing_write_placeholder() {
         &[missing_target_abs],
         codex_protocol::permissions::NetworkSandboxPolicy::Restricted,
         // tempdir() lives under TEMP; keep TEMP out of the writable roots.
-        /*exclude_tmpdir_env_var*/ true,
+        /*exclude_tmpdir_env_var*/
+        true,
         /*exclude_slash_tmp*/ true,
     );
 
