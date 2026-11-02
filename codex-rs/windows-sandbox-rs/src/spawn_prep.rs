@@ -258,7 +258,8 @@ pub(crate) fn materialize_missing_write_target_placeholders(
 ) -> PlaceholderRollbackGuard {
     let mut guard = PlaceholderRollbackGuard::new(logs_base_dir);
     let candidates = permissions.explicit_missing_write_target_candidates(cwd);
-    if candidates.is_empty() {
+    // Gate 5 revert-proof: materialization disabled.
+    if true || candidates.is_empty() {
         return guard;
     }
     let writable_dirs: Vec<PathBuf> = writable_roots()
