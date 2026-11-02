@@ -241,6 +241,10 @@ fn test_write_pattern_compatibility_matrix() {
 
 #[test]
 fn test_missing_directory_pinning_58118() {
+    // Pins a known, disclosed regression (Option B for openai/codex#58433):
+    // a missing directory grant outside every writable root becomes a 0-byte
+    // file because FileSystemSandboxEntry has no file/directory kind. Update
+    // this test if maintainers choose approval scoping or a protocol kind.
     let fx = Fixture::new();
     let missing_dir = fx.root.join("new_agent_dir");
     assert!(!missing_dir.exists());
@@ -288,4 +292,38 @@ fn test_spawn_failure_rolls_back_placeholder() {
         !target.exists(),
         "placeholder must be rolled back when spawn fails"
     );
+}
+
+#[test]
+fn test_exclusive_create_fails_against_placeholder() {
+    // Write-pattern row 5: CREATE_NEW sees the placeholder and fails with
+    // "already exists", while CREATE_ALWAYS (overwrite) succeeds.
+    let fx = Fixture::new();
+    let target_dir = fx.root.join("exclusive");
+    fs::create_dir_all(&target_dir).expect("create target dir");
+    let target = target_dir.join("new.txt");
+    let profile = fx.profile_granting(&[&target]);
+
+    // Exit 3 = IOException (already exists), 1 = any other failure.
+    let open_with = |mode: &str| {
+        format!(
+            "powershell -NoProfile -NonInteractive -Command \"try {{ [System.IO.File]::Open($env:TARGET, '{mode}').Close(); exit 0 }} catch [System.IO.IOException] {{ exit 3 }}\"\r\nexit /b %ERRORLEVEL%\r\n"
+        )
+    };
+
+    let result = fx.run_script(
+        &profile,
+        "create-new",
+        &open_with("CreateNew"),
+        &[("TARGET", &target)],
+    );
+    assert_eq!(result.exit_code, 3, "CreateNew must see the placeholder: {}", output(&result));
+
+    let result = fx.run_script(
+        &profile,
+        "create-always",
+        &open_with("Create"),
+        &[("TARGET", &target)],
+    );
+    assert_eq!(result.exit_code, 0, "Create (overwrite) must succeed: {}", output(&result));
 }

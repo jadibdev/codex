@@ -8,6 +8,8 @@ on:
   push:
     branches:
       - "ci/windows-sandbox-58433"
+      # Gate 5 revert-proof: same tests with materialization disabled.
+      - "ci/windows-sandbox-58433-revert"
   workflow_dispatch:
 
 concurrency:
@@ -41,6 +43,20 @@ jobs:
       - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
         with:
           components: clippy, rustfmt
+
+      # The rusty_v8 fork's Chromium submodules take ~9 min to clone and the
+      # crate ~8 min to build; reuse both across runs.
+      - name: Cache cargo downloads and build output
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            ${{ env.CARGO_TARGET_DIR }}
+          key: windows-sandbox-58433-${{ hashFiles('codex-rs/Cargo.lock', 'codex-rs/rust-toolchain.toml') }}-${{ github.sha }}
+          restore-keys: |
+            windows-sandbox-58433-${{ hashFiles('codex-rs/Cargo.lock', 'codex-rs/rust-toolchain.toml') }}-
 
       - name: Record environment
         run: |

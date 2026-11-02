@@ -265,10 +265,11 @@ pub(crate) fn materialize_missing_write_target_placeholders(
         .into_iter()
         .filter(|root| root.is_dir())
         .collect();
-    let mut deny_paths: Vec<PathBuf> = compute_allow_paths_for_permissions(permissions, cwd, env_map)
-        .deny
-        .into_iter()
-        .collect();
+    let mut deny_paths: Vec<PathBuf> =
+        compute_allow_paths_for_permissions(permissions, cwd, env_map)
+            .deny
+            .into_iter()
+            .collect();
     deny_paths.extend(additional_deny_write_paths.iter().cloned());
 
     for candidate in candidates {
@@ -668,10 +669,11 @@ pub(crate) fn prepare_elevated_spawn_context_for_permissions(
             if !permissions.uses_write_capabilities_for_cwd(cwd, env_map) {
                 return Vec::new();
             }
-            let allow: Vec<PathBuf> = compute_allow_paths_for_permissions(&permissions, cwd, env_map)
-                .allow
-                .into_iter()
-                .collect();
+            let allow: Vec<PathBuf> =
+                compute_allow_paths_for_permissions(&permissions, cwd, env_map)
+                    .allow
+                    .into_iter()
+                    .collect();
             effective_write_roots_for_permissions(
                 &permissions,
                 cwd,
@@ -1167,16 +1169,15 @@ mod tests {
         let permissions =
             ResolvedWindowsSandboxPermissions::try_from_permission_profile(&profile).unwrap();
 
-        let guard =
-            materialize_missing_write_target_placeholders(
-                &permissions,
-                &cwd,
-                &HashMap::new(),
-                &codex_home,
-                &[],
-                None,
-                Vec::new,
-            );
+        let guard = materialize_missing_write_target_placeholders(
+            &permissions,
+            &cwd,
+            &HashMap::new(),
+            &codex_home,
+            &[],
+            None,
+            Vec::new,
+        );
         assert!(
             guard.is_empty(),
             "missing parent directory must be skipped without creating parent"
@@ -1224,16 +1225,15 @@ mod tests {
         let permissions =
             ResolvedWindowsSandboxPermissions::try_from_permission_profile(&profile).unwrap();
 
-        let guard =
-            materialize_missing_write_target_placeholders(
-                &permissions,
-                &cwd,
-                &HashMap::new(),
-                &codex_home,
-                &[],
-                None,
-                Vec::new,
-            );
+        let guard = materialize_missing_write_target_placeholders(
+            &permissions,
+            &cwd,
+            &HashMap::new(),
+            &codex_home,
+            &[],
+            None,
+            Vec::new,
+        );
         assert!(
             guard.is_empty(),
             "existing file must not be added to rollback guard"
@@ -1313,13 +1313,22 @@ mod tests {
             std::slice::from_ref(&protected),
         );
 
-        assert!(!workspace_out.exists(), "creatable under the writable workspace");
+        assert!(
+            !workspace_out.exists(),
+            "creatable under the writable workspace"
+        );
         assert!(!temp_out.exists(), "creatable under TEMP from env_map");
         assert!(!denied_new.exists(), "inside a denied directory");
-        assert!(outside_new.is_file(), "outside every writable root gets a placeholder");
+        assert!(
+            outside_new.is_file(),
+            "outside every writable root gets a placeholder"
+        );
 
         drop(guard);
-        assert!(!outside_new.exists(), "uncommitted placeholder is rolled back");
+        assert!(
+            !outside_new.exists(),
+            "uncommitted placeholder is rolled back"
+        );
     }
 
     #[test]
@@ -1355,8 +1364,101 @@ mod tests {
             &[],
         );
 
-        assert!(target.is_file(), "placeholder must be created under USERPROFILE");
+        assert!(
+            target.is_file(),
+            "placeholder must be created under USERPROFILE"
+        );
         drop(guard);
         assert!(!target.exists(), "rollback removes the test placeholder");
+    }
+
+    fn sandbox_log_text(logs_dir: &Path) -> String {
+        std::fs::read_dir(logs_dir)
+            .expect("read log dir")
+            .filter_map(|entry| std::fs::read_to_string(entry.ok()?.path()).ok())
+            .collect()
+    }
+
+    #[test]
+    fn rollback_skip_is_written_to_sandbox_log() {
+        let tmp = TempDir::new().expect("tempdir");
+        let logs = TempDir::new().expect("logs tempdir");
+        let parent_handle = open_directory_no_reparse(
+            tmp.path(),
+            FILE_TRAVERSE | FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            DirectoryOpenDisposition::OpenExisting,
+        )
+        .expect("open parent");
+        let path = tmp.path().join("kept.txt");
+        let handle = create_placeholder_file(&parent_handle, std::ffi::OsStr::new("kept.txt"))
+            .expect("create placeholder");
+        let mut guard = PlaceholderRollbackGuard::new(Some(logs.path()));
+        guard.push(path.clone(), handle);
+        std::fs::write(&path, "user data").expect("write user data");
+
+        drop(guard);
+
+        assert!(path.exists(), "non-empty file is kept");
+        let log = sandbox_log_text(logs.path());
+        assert!(
+            log.contains("placeholder rollback skipped") && log.contains("non-empty"),
+            "log: {log}"
+        );
+    }
+
+    #[test]
+    fn materialize_placeholders_rejects_parent_and_ancestor_junctions() {
+        let tmp = TempDir::new().expect("tempdir");
+        let logs = TempDir::new().expect("logs tempdir");
+        let cwd = tmp.path().join("work");
+        let codex_home = tmp.path().join("codex-home");
+        let real = tmp.path().join("real");
+        let link = tmp.path().join("link");
+        for dir in [&cwd, &codex_home, &real.join("sub")] {
+            std::fs::create_dir_all(dir).expect("create dir");
+        }
+        let status = std::process::Command::new("cmd.exe")
+            .args(["/d", "/c", "mklink", "/J"])
+            .arg(&link)
+            .arg(&real)
+            .output()
+            .expect("run mklink");
+        assert!(status.status.success(), "mklink /J failed: {status:?}");
+
+        let through_parent = link.join("escaped.txt");
+        let through_ancestor = link.join("sub").join("escaped.txt");
+        let profile = workspace_profile(
+            NetworkSandboxPolicy::Restricted,
+            &[absolute(&through_parent), absolute(&through_ancestor)],
+            /*exclude_tmpdir_env_var*/ true,
+            /*exclude_slash_tmp*/ true,
+        );
+        let permissions =
+            ResolvedWindowsSandboxPermissions::try_from_permission_profile_for_workspace_roots(
+                &profile,
+                workspace_roots_for(&cwd).as_slice(),
+            )
+            .expect("managed permission profile");
+
+        let guard = materialize_missing_write_target_placeholders(
+            &permissions,
+            &cwd,
+            &HashMap::new(),
+            &codex_home,
+            &[],
+            Some(logs.path()),
+            Vec::new,
+        );
+
+        assert!(guard.is_empty(), "nothing may be created through a junction");
+        assert!(!real.join("escaped.txt").exists());
+        assert!(!real.join("sub").join("escaped.txt").exists());
+        let log = sandbox_log_text(logs.path());
+        assert_eq!(
+            log.matches("placeholder parent open failed").count(),
+            2,
+            "log: {log}"
+        );
     }
 }
