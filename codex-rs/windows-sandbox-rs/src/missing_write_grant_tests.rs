@@ -317,7 +317,12 @@ fn test_exclusive_create_fails_against_placeholder() {
         &open_with("CreateNew"),
         &[("TARGET", &target)],
     );
-    assert_eq!(result.exit_code, 3, "CreateNew must see the placeholder: {}", output(&result));
+    assert_eq!(
+        result.exit_code,
+        3,
+        "CreateNew must see the placeholder: {}",
+        output(&result)
+    );
 
     let result = fx.run_script(
         &profile,
@@ -325,5 +330,10 @@ fn test_exclusive_create_fails_against_placeholder() {
         &open_with("Create"),
         &[("TARGET", &target)],
     );
-    assert_eq!(result.exit_code, 0, "Create (overwrite) must succeed: {}", output(&result));
+    assert_eq!(
+        result.exit_code,
+        0,
+        "Create (overwrite) must succeed: {}",
+        output(&result)
+    );
 }

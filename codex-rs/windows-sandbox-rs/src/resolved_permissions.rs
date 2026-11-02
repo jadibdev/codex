@@ -1,3 +1,5 @@
+use crate::path_normalization::canonical_path_key;
+use crate::path_normalization::path_key_strictly_contains;
 use anyhow::Result;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::permissions::FileSystemPath;
@@ -7,8 +9,6 @@ use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_protocol::permissions::FileSystemSpecialPath::Root;
 use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::permissions::ReadDenyMatcher;
-use crate::path_normalization::canonical_path_key;
-use crate::path_normalization::path_key_strictly_contains;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use std::collections::HashMap;
 use std::path::Path;
@@ -929,12 +929,8 @@ mod tests {
         let cwd = dir.path().join("work");
         std::fs::create_dir_all(&cwd).unwrap();
         let new_dir = dir.path().join("new_dir");
-        let upper_child = PathBuf::from(
-            new_dir
-                .join(".git")
-                .to_string_lossy()
-                .to_ascii_uppercase(),
-        );
+        let upper_child =
+            PathBuf::from(new_dir.join(".git").to_string_lossy().to_ascii_uppercase());
 
         let profile = permission_profile_with_entries(vec![
             root_read_entry(),
@@ -944,7 +940,11 @@ mod tests {
         let permissions =
             ResolvedWindowsSandboxPermissions::try_from_permission_profile(&profile).unwrap();
 
-        assert!(permissions.explicit_missing_write_target_candidates(&cwd).is_empty());
+        assert!(
+            permissions
+                .explicit_missing_write_target_candidates(&cwd)
+                .is_empty()
+        );
     }
 
     #[test]

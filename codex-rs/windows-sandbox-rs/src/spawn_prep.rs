@@ -1451,7 +1451,10 @@ mod tests {
             Vec::new,
         );
 
-        assert!(guard.is_empty(), "nothing may be created through a junction");
+        assert!(
+            guard.is_empty(),
+            "nothing may be created through a junction"
+        );
         assert!(!real.join("escaped.txt").exists());
         assert!(!real.join("sub").join("escaped.txt").exists());
         let log = sandbox_log_text(logs.path());

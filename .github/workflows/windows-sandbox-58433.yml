@@ -46,8 +46,10 @@ jobs:
 
       # The rusty_v8 fork's Chromium submodules take ~9 min to clone and the
       # crate ~8 min to build; reuse both across runs.
-      - name: Cache cargo downloads and build output
-        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+      # Restore and save are split because the job always fails on the 9
+      # baseline runner failures, and actions/cache only saves on success.
+      - name: Restore cargo downloads and build output
+        uses: actions/cache/restore@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
         with:
           path: |
             ~/.cargo/registry/index
@@ -129,6 +131,17 @@ jobs:
             grep -E "^test result:|^test .*(placeholder|candidates|missing_write|58433|58118|write_pattern|is_allowed_write_target)" "${log}" || echo "no test log"
             echo '```'
           } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Save cargo downloads and build output
+        if: always()
+        uses: actions/cache/save@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            ${{ env.CARGO_TARGET_DIR }}
+          key: windows-sandbox-58433-${{ hashFiles('codex-rs/Cargo.lock', 'codex-rs/rust-toolchain.toml') }}-${{ github.sha }}
 
       - name: Upload logs
         if: always()
