@@ -130,13 +130,6 @@ mod windows_impl {
             .iter()
             .map(AbsolutePathBuf::to_path_buf)
             .collect::<Vec<_>>();
-        let mut placeholder_guard =
-            crate::spawn_prep::materialize_missing_write_target_placeholders(
-                &permissions,
-                cwd,
-                codex_home,
-                &deny_write_paths_override,
-            );
         normalize_null_device_env(&mut env_map);
         ensure_non_interactive_pager(&mut env_map);
         inherit_path_env(&mut env_map);
@@ -147,6 +140,25 @@ mod windows_impl {
 
         let logs_base_dir: Option<&Path> = Some(sandbox_base.as_path());
         log_start(&command, logs_base_dir);
+        // Same roots the capability SIDs below are minted for.
+        let mut placeholder_guard =
+            crate::spawn_prep::materialize_missing_write_target_placeholders(
+                &permissions,
+                cwd,
+                &env_map,
+                codex_home,
+                &deny_write_paths_override,
+                logs_base_dir,
+                || {
+                    effective_write_roots_for_permissions(
+                        &permissions,
+                        cwd,
+                        &env_map,
+                        codex_home,
+                        write_roots_override,
+                    )
+                },
+            );
         let sandbox_creds = require_logon_sandbox_creds(
             &permissions,
             cwd,

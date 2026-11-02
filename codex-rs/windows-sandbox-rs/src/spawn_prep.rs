@@ -77,13 +77,15 @@ const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x20;
 /// object with `DELETE` instead of looking the path up again.
 pub(crate) struct PlaceholderRollbackGuard {
     entries: Vec<(PathBuf, OwnedHandle)>,
+    logs_base_dir: Option<PathBuf>,
     committed: bool,
 }
 
 impl PlaceholderRollbackGuard {
-    pub(crate) fn empty() -> Self {
+    pub(crate) fn new(logs_base_dir: Option<&Path>) -> Self {
         Self {
             entries: Vec::new(),
+            logs_base_dir: logs_base_dir.map(Path::to_path_buf),
             committed: false,
         }
     }
@@ -115,7 +117,7 @@ impl Drop for PlaceholderRollbackGuard {
                         "placeholder rollback skipped for {}: {reason}",
                         path.display()
                     ),
-                    None,
+                    self.logs_base_dir.as_deref(),
                 );
             }
         }
@@ -237,14 +239,38 @@ pub(crate) struct LegacyAclSids<'a> {
     pub(crate) write_root_sids: &'a [RootCapabilitySid],
 }
 
+/// Creates 0-byte placeholders for explicit write grants that do not exist yet,
+/// so the exact-file ACE can attach without granting anything on the parent.
+///
+/// `writable_roots` must return the roots this launch actually grants ACLs on;
+/// it is only called when there is a candidate. A candidate whose parent is
+/// already one of those roots (and not denied) is left for the child to create,
+/// as a file or a directory.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn materialize_missing_write_target_placeholders(
     permissions: &ResolvedWindowsSandboxPermissions,
     cwd: &Path,
+    env_map: &HashMap<String, String>,
     codex_home: &Path,
     additional_deny_write_paths: &[PathBuf],
+    logs_base_dir: Option<&Path>,
+    writable_roots: impl FnOnce() -> Vec<PathBuf>,
 ) -> PlaceholderRollbackGuard {
-    let mut guard = PlaceholderRollbackGuard::empty();
+    let mut guard = PlaceholderRollbackGuard::new(logs_base_dir);
     let candidates = permissions.explicit_missing_write_target_candidates(cwd);
+    if candidates.is_empty() {
+        return guard;
+    }
+    let writable_dirs: Vec<PathBuf> = writable_roots()
+        .into_iter()
+        .filter(|root| root.is_dir())
+        .collect();
+    let mut deny_paths: Vec<PathBuf> = compute_allow_paths_for_permissions(permissions, cwd, env_map)
+        .deny
+        .into_iter()
+        .collect();
+    deny_paths.extend(additional_deny_write_paths.iter().cloned());
+
     for candidate in candidates {
         if candidate.symlink_metadata().is_ok() {
             continue;
@@ -271,6 +297,20 @@ pub(crate) fn materialize_missing_write_target_placeholders(
         if parent.symlink_metadata().is_err() {
             continue;
         }
+        // Inside a denied directory the grant must not become writable; inside a
+        // writable root the child can create it itself. Either way, no placeholder.
+        if deny_paths
+            .iter()
+            .any(|deny| workspace_write_root_contains_path(deny, parent))
+        {
+            continue;
+        }
+        if writable_dirs
+            .iter()
+            .any(|root| workspace_write_root_contains_path(root, parent))
+        {
+            continue;
+        }
         let parent_handle = match open_directory_no_reparse(
             parent,
             FILE_TRAVERSE | FILE_READ_ATTRIBUTES,
@@ -284,7 +324,7 @@ pub(crate) fn materialize_missing_write_target_placeholders(
                         "placeholder parent open failed for {}: {err}",
                         candidate.display()
                     ),
-                    None,
+                    logs_base_dir,
                 );
                 continue;
             }
@@ -300,7 +340,7 @@ pub(crate) fn materialize_missing_write_target_placeholders(
                         "placeholder creation skipped for {}: {err}",
                         candidate.display()
                     ),
-                    None,
+                    logs_base_dir,
                 );
             }
         }
@@ -340,11 +380,15 @@ pub(crate) fn prepare_spawn_context_common(
     let logs_base_dir = Some(sandbox_base);
     log_start(command, logs_base_dir.as_deref());
 
+    let env_map: &HashMap<String, String> = env_map;
     let placeholder_guard = materialize_missing_write_target_placeholders(
         &permissions,
         cwd,
+        env_map,
         codex_home,
         additional_deny_write_paths,
+        logs_base_dir.as_deref(),
+        || legacy_session_capability_roots(&permissions, cwd, env_map, codex_home),
     );
 
     let uses_write_capabilities = permissions.uses_write_capabilities_for_cwd(cwd, env_map);
@@ -612,11 +656,30 @@ pub(crate) fn prepare_elevated_spawn_context_for_permissions(
     let logs_base_dir = Some(sandbox_base.clone());
     log_start(command, logs_base_dir.as_deref());
 
+    // Same roots this launch hands to setup below.
     let placeholder_guard = materialize_missing_write_target_placeholders(
         &permissions,
         cwd,
+        env_map,
         codex_home,
         deny_write_paths_override,
+        logs_base_dir.as_deref(),
+        || {
+            if !permissions.uses_write_capabilities_for_cwd(cwd, env_map) {
+                return Vec::new();
+            }
+            let allow: Vec<PathBuf> = compute_allow_paths_for_permissions(&permissions, cwd, env_map)
+                .allow
+                .into_iter()
+                .collect();
+            effective_write_roots_for_permissions(
+                &permissions,
+                cwd,
+                env_map,
+                codex_home,
+                write_roots_override.or(Some(allow.as_slice())),
+            )
+        },
     );
 
     let uses_write_capabilities = permissions.uses_write_capabilities_for_cwd(cwd, env_map);
@@ -991,7 +1054,7 @@ mod tests {
         let handle = create_placeholder_file(&parent_handle, std::ffi::OsStr::new(name))
             .expect("create placeholder");
         let path = dir.join(name);
-        let mut guard = PlaceholderRollbackGuard::empty();
+        let mut guard = PlaceholderRollbackGuard::new(None);
         guard.push(path.clone(), handle);
         (path, guard)
     }
@@ -1105,7 +1168,15 @@ mod tests {
             ResolvedWindowsSandboxPermissions::try_from_permission_profile(&profile).unwrap();
 
         let guard =
-            materialize_missing_write_target_placeholders(&permissions, &cwd, &codex_home, &[]);
+            materialize_missing_write_target_placeholders(
+                &permissions,
+                &cwd,
+                &HashMap::new(),
+                &codex_home,
+                &[],
+                None,
+                Vec::new,
+            );
         assert!(
             guard.is_empty(),
             "missing parent directory must be skipped without creating parent"
@@ -1154,7 +1225,15 @@ mod tests {
             ResolvedWindowsSandboxPermissions::try_from_permission_profile(&profile).unwrap();
 
         let guard =
-            materialize_missing_write_target_placeholders(&permissions, &cwd, &codex_home, &[]);
+            materialize_missing_write_target_placeholders(
+                &permissions,
+                &cwd,
+                &HashMap::new(),
+                &codex_home,
+                &[],
+                None,
+                Vec::new,
+            );
         assert!(
             guard.is_empty(),
             "existing file must not be added to rollback guard"
@@ -1163,5 +1242,121 @@ mod tests {
             std::fs::read_to_string(&existing_file).unwrap(),
             "existing file content"
         );
+    }
+
+    fn absolute(path: &Path) -> AbsolutePathBuf {
+        AbsolutePathBuf::from_absolute_path(path).expect("absolute path")
+    }
+
+    /// Materializes with the same roots a legacy launch grants ACLs on.
+    fn materialize_with_legacy_roots(
+        profile: &PermissionProfile,
+        workspace: &Path,
+        env_map: &HashMap<String, String>,
+        codex_home: &Path,
+        additional_deny_write_paths: &[PathBuf],
+    ) -> PlaceholderRollbackGuard {
+        let permissions =
+            ResolvedWindowsSandboxPermissions::try_from_permission_profile_for_workspace_roots(
+                profile,
+                workspace_roots_for(workspace).as_slice(),
+            )
+            .expect("managed permission profile");
+        materialize_missing_write_target_placeholders(
+            &permissions,
+            workspace,
+            env_map,
+            codex_home,
+            additional_deny_write_paths,
+            None,
+            || legacy_session_capability_roots(&permissions, workspace, env_map, codex_home),
+        )
+    }
+
+    #[test]
+    fn materialize_placeholders_n6_effective_parent_matrix() {
+        let tmp = TempDir::new().expect("tempdir");
+        let workspace = tmp.path().join("workspace");
+        let codex_home = tmp.path().join("codex-home");
+        let temp_dir = tmp.path().join("temp");
+        let protected = workspace.join("protected");
+        let outside = tmp.path().join("outside");
+        for dir in [&workspace, &codex_home, &temp_dir, &protected, &outside] {
+            std::fs::create_dir_all(dir).expect("create dir");
+        }
+        let workspace_out = workspace.join("out");
+        let temp_out = temp_dir.join("out");
+        let denied_new = protected.join("new.txt");
+        let outside_new = outside.join("new.txt");
+
+        let profile = workspace_profile(
+            NetworkSandboxPolicy::Restricted,
+            &[
+                absolute(&workspace_out),
+                absolute(&temp_out),
+                absolute(&denied_new),
+                absolute(&outside_new),
+            ],
+            /*exclude_tmpdir_env_var*/ false,
+            /*exclude_slash_tmp*/ true,
+        );
+        let env_map = HashMap::from([
+            ("TEMP".to_string(), temp_dir.display().to_string()),
+            ("TMP".to_string(), temp_dir.display().to_string()),
+        ]);
+
+        let guard = materialize_with_legacy_roots(
+            &profile,
+            &workspace,
+            &env_map,
+            &codex_home,
+            std::slice::from_ref(&protected),
+        );
+
+        assert!(!workspace_out.exists(), "creatable under the writable workspace");
+        assert!(!temp_out.exists(), "creatable under TEMP from env_map");
+        assert!(!denied_new.exists(), "inside a denied directory");
+        assert!(outside_new.is_file(), "outside every writable root gets a placeholder");
+
+        drop(guard);
+        assert!(!outside_new.exists(), "uncommitted placeholder is rolled back");
+    }
+
+    #[test]
+    fn materialize_placeholders_targets_user_profile_children_when_cwd_is_user_profile() {
+        // Windows strips USERPROFILE itself from writable roots, so a missing
+        // file directly under it is not creatable by the child even when the
+        // policy marks cwd == USERPROFILE writable (openai/codex#58433 RF-1).
+        let Some(user_profile) = std::env::var_os("USERPROFILE").map(PathBuf::from) else {
+            return;
+        };
+        let codex_home = TempDir::new().expect("tempdir");
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let target = user_profile.join(format!(
+            "codex-58433-placeholder-{}-{nonce}.txt",
+            std::process::id()
+        ));
+        assert!(!target.exists());
+        let profile = workspace_profile(
+            NetworkSandboxPolicy::Restricted,
+            &[absolute(&target)],
+            /*exclude_tmpdir_env_var*/ true,
+            /*exclude_slash_tmp*/ true,
+        );
+
+        let guard = materialize_with_legacy_roots(
+            &profile,
+            &user_profile,
+            &HashMap::new(),
+            codex_home.path(),
+            &[],
+        );
+
+        assert!(target.is_file(), "placeholder must be created under USERPROFILE");
+        drop(guard);
+        assert!(!target.exists(), "rollback removes the test placeholder");
     }
 }

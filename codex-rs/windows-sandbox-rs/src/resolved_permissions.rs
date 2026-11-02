@@ -229,13 +229,6 @@ impl ResolvedWindowsSandboxPermissions {
             {
                 continue;
             }
-            // The child can already create it, as a file or a directory, so a
-            // placeholder would only pin its type.
-            if let Some(parent) = candidate.parent()
-                && self.file_system.can_write_local_path_with_cwd(parent, cwd)
-            {
-                continue;
-            }
             if !candidates.contains(&candidate) {
                 candidates.push(candidate);
             }
@@ -887,46 +880,6 @@ mod tests {
         assert!(
             candidates.is_empty(),
             "deny glob matching file must be excluded"
-        );
-    }
-
-    #[test]
-    fn candidates_excludes_missing_paths_under_writable_parent() {
-        // A missing `out` inside a writable workspace can be created by the
-        // child itself; a placeholder would only turn the directory into a file.
-        let dir = TempDir::new().unwrap();
-        let cwd = dir.path().join("work");
-        std::fs::create_dir_all(&cwd).unwrap();
-        let out_dir = cwd.join("out");
-
-        let profile = permission_profile_with_entries(vec![
-            FileSystemSandboxEntry::new(
-                FileSystemPath::Special {
-                    value: FileSystemSpecialPath::Root,
-                },
-                FileSystemAccessMode::Read,
-            ),
-            FileSystemSandboxEntry::new(
-                FileSystemPath::Path {
-                    path: AbsolutePathBuf::from_absolute_path(&cwd).unwrap().into(),
-                },
-                FileSystemAccessMode::Write,
-            ),
-            FileSystemSandboxEntry::new(
-                FileSystemPath::Path {
-                    path: AbsolutePathBuf::from_absolute_path(&out_dir)
-                        .unwrap()
-                        .into(),
-                },
-                FileSystemAccessMode::Write,
-            ),
-        ]);
-        let permissions =
-            ResolvedWindowsSandboxPermissions::try_from_permission_profile(&profile).unwrap();
-        let candidates = permissions.explicit_missing_write_target_candidates(&cwd);
-        assert!(
-            candidates.is_empty(),
-            "creatable path must not get a placeholder"
         );
     }
 }
