@@ -847,7 +847,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let cwd = dir.path().join("work");
         std::fs::create_dir_all(&cwd).unwrap();
-        let target = dir.path().join("secret.env");
+        // Relative deny globs are anchored at cwd, so the target must live under it.
+        let target = cwd.join("secret.env");
 
         let profile = permission_profile_with_entries(vec![
             FileSystemSandboxEntry::new(

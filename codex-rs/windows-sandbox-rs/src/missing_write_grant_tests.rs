@@ -1,304 +1,226 @@
 use std::collections::HashMap;
 use std::fs;
+use std::path::Path;
 use std::path::PathBuf;
 use tempfile::TempDir;
 
+use codex_protocol::models::ManagedFileSystemPermissions;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::permissions::FileSystemAccessMode;
 use codex_protocol::permissions::FileSystemPath;
 use codex_protocol::permissions::FileSystemSandboxEntry;
 use codex_protocol::permissions::FileSystemSpecialPath;
-use codex_protocol::models::ManagedFileSystemPermissions;
 use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_utils_absolute_path::AbsolutePathBuf;
 
+use crate::CaptureResult;
 use crate::run_windows_sandbox_capture;
 
-fn setup_test_env(cwd: &PathBuf) -> HashMap<String, String> {
-    let mut env = HashMap::from([
-        ("TEMP".to_string(), cwd.display().to_string()),
-        ("TMP".to_string(), cwd.display().to_string()),
-    ]);
-    for name in ["PATH", "SystemRoot", "COMSPEC", "USERPROFILE"] {
-        if let Ok(value) = std::env::var(name) {
-            env.insert(name.to_string(), value);
+struct Fixture {
+    _tmp: TempDir,
+    root: PathBuf,
+    cwd: PathBuf,
+    codex_home: PathBuf,
+}
+
+impl Fixture {
+    fn new() -> Self {
+        let tmp = TempDir::new().expect("tempdir");
+        let root = tmp.path().to_path_buf();
+        let cwd = root.join("workspace");
+        let codex_home = root.join("codex-home");
+        fs::create_dir_all(&cwd).expect("create cwd");
+        fs::create_dir_all(&codex_home).expect("create codex home");
+        Self {
+            _tmp: tmp,
+            root,
+            cwd,
+            codex_home,
         }
     }
-    env
+
+    /// Workspace-write profile for `cwd` plus exact write grants for `targets`.
+    fn profile_granting(&self, targets: &[&Path]) -> PermissionProfile {
+        let mut entries = vec![
+            FileSystemSandboxEntry::new(
+                FileSystemPath::Special {
+                    value: FileSystemSpecialPath::Root,
+                },
+                FileSystemAccessMode::Read,
+            ),
+            write_entry(&self.cwd),
+        ];
+        entries.extend(targets.iter().map(|target| write_entry(target)));
+        PermissionProfile::Managed {
+            file_system: ManagedFileSystemPermissions::Restricted {
+                entries,
+                glob_scan_max_depth: None,
+            },
+            network: NetworkSandboxPolicy::Restricted,
+        }
+    }
+
+    /// Runs `body` as a .cmd script from the workspace. Paths are passed through
+    /// environment variables so no argument needs cmd.exe-incompatible quoting.
+    fn run_script(
+        &self,
+        profile: &PermissionProfile,
+        name: &str,
+        body: &str,
+        vars: &[(&str, &Path)],
+    ) -> CaptureResult {
+        let script = self.cwd.join(format!("{name}.cmd"));
+        fs::write(&script, format!("@echo off\r\n{body}")).expect("write script");
+
+        let mut env = HashMap::from([
+            ("TEMP".to_string(), self.cwd.display().to_string()),
+            ("TMP".to_string(), self.cwd.display().to_string()),
+        ]);
+        for name in ["PATH", "SystemRoot", "COMSPEC", "USERPROFILE"] {
+            if let Ok(value) = std::env::var(name) {
+                env.insert(name.to_string(), value);
+            }
+        }
+        for (key, path) in vars {
+            env.insert((*key).to_string(), path.display().to_string());
+        }
+
+        let workspace_roots = vec![AbsolutePathBuf::from_absolute_path(&self.cwd).unwrap()];
+        run_windows_sandbox_capture(
+            profile,
+            workspace_roots.as_slice(),
+            &self.codex_home,
+            vec![
+                "cmd.exe".to_string(),
+                "/d".to_string(),
+                "/c".to_string(),
+                script.display().to_string(),
+            ],
+            &self.cwd,
+            env,
+            Some(30_000),
+            None,
+        )
+        .expect("run sandboxed script")
+    }
+}
+
+fn write_entry(path: &Path) -> FileSystemSandboxEntry {
+    FileSystemSandboxEntry::new(
+        FileSystemPath::Path {
+            path: AbsolutePathBuf::from_absolute_path(path).unwrap().into(),
+        },
+        FileSystemAccessMode::Write,
+    )
+}
+
+fn output(result: &CaptureResult) -> String {
+    format!(
+        "exit={} stdout={} stderr={}",
+        result.exit_code,
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    )
 }
 
 #[test]
 fn test_end_to_end_missing_write_grant_reproduction_issue_58433() {
-    let tmp = TempDir::new().expect("tempdir");
-    let cwd = tmp.path().join("workspace");
-    let codex_home = tmp.path().join("codex-home");
-    let desktop_dir = tmp.path().join("desktop");
-    fs::create_dir_all(&cwd).expect("create cwd");
-    fs::create_dir_all(&codex_home).expect("create codex home");
+    let fx = Fixture::new();
+    let desktop_dir = fx.root.join("desktop");
     fs::create_dir_all(&desktop_dir).expect("create desktop dir");
-
     let brief_docx = desktop_dir.join("brief.docx");
     let forbidden_file = desktop_dir.join("forbidden.txt");
     assert!(!brief_docx.exists());
-    assert!(!forbidden_file.exists());
+    let profile = fx.profile_granting(&[&brief_docx]);
 
-    let profile = PermissionProfile::Managed {
-        file_system: ManagedFileSystemPermissions::Restricted {
-            entries: vec![
-                FileSystemSandboxEntry::new(
-                    FileSystemPath::Special {
-                        value: FileSystemSpecialPath::Root,
-                    },
-                    FileSystemAccessMode::Read,
-                ),
-                FileSystemSandboxEntry::new(
-                    FileSystemPath::Path {
-                        path: AbsolutePathBuf::from_absolute_path(&cwd).unwrap().into(),
-                    },
-                    FileSystemAccessMode::Write,
-                ),
-                FileSystemSandboxEntry::new(
-                    FileSystemPath::Path {
-                        path: AbsolutePathBuf::from_absolute_path(&brief_docx).unwrap().into(),
-                    },
-                    FileSystemAccessMode::Write,
-                ),
-            ],
-            glob_scan_max_depth: None,
-        },
-        network: NetworkSandboxPolicy::Restricted,
-    };
-
-    let env = setup_test_env(&cwd);
-    let workspace_roots = vec![AbsolutePathBuf::from_absolute_path(&cwd).unwrap()];
-
-    // 1. Run in-place write to brief.docx (the core #58433 repro)
-    let write_cmd = vec![
-        "cmd.exe".to_string(),
-        "/c".to_string(),
-        format!("echo hello from sandbox > \"{}\"", brief_docx.display()),
-    ];
-
-    let result = run_windows_sandbox_capture(
+    // The core #58433 repro: in-place write to an approved file that did not exist.
+    let result = fx.run_script(
         &profile,
-        workspace_roots.as_slice(),
-        &codex_home,
-        write_cmd,
-        &cwd,
-        env.clone(),
-        Some(30_000),
-        None,
-    )
-    .expect("run sandboxed write");
-
-    assert_eq!(result.exit_code, 0, "sandbox command must succeed: stderr={}", String::from_utf8_lossy(&result.stderr));
-    assert!(brief_docx.exists(), "brief.docx must exist after approved sandboxed write");
+        "write-brief",
+        "echo hello from sandbox> \"%TARGET%\"\r\nexit /b %ERRORLEVEL%\r\n",
+        &[("TARGET", &brief_docx)],
+    );
+    assert_eq!(result.exit_code, 0, "approved write must succeed: {}", output(&result));
     let content = fs::read_to_string(&brief_docx).expect("read brief.docx");
-    assert!(content.contains("hello from sandbox"), "content must match: {content}");
+    assert!(content.contains("hello from sandbox"), "content: {content}");
 
-    // 2. Attempt write to sibling forbidden.txt in the same desktop directory (must fail with access denied)
-    let forbidden_cmd = vec![
-        "cmd.exe".to_string(),
-        "/c".to_string(),
-        format!("echo evil > \"{}\"", forbidden_file.display()),
-    ];
-
-    let forbidden_result = run_windows_sandbox_capture(
+    // A sibling in the same ungranted directory stays denied.
+    let result = fx.run_script(
         &profile,
-        workspace_roots.as_slice(),
-        &codex_home,
-        forbidden_cmd,
-        &cwd,
-        env,
-        Some(30_000),
-        None,
-    )
-    .expect("run forbidden command");
-
-    assert_ne!(forbidden_result.exit_code, 0, "unauthorized sibling write must fail");
-    assert!(!forbidden_file.exists(), "forbidden.txt must NOT be created");
+        "write-sibling",
+        "echo evil> \"%TARGET%\"\r\nexit /b %ERRORLEVEL%\r\n",
+        &[("TARGET", &forbidden_file)],
+    );
+    assert_ne!(result.exit_code, 0, "sibling write must fail: {}", output(&result));
+    assert!(!forbidden_file.exists(), "forbidden.txt must not be created");
 }
 
 #[test]
 fn test_write_pattern_compatibility_matrix() {
-    let tmp = TempDir::new().expect("tempdir");
-    let cwd = tmp.path().join("workspace");
-    let codex_home = tmp.path().join("codex-home");
-    let target_dir = tmp.path().join("target_dir");
-    fs::create_dir_all(&cwd).expect("create cwd");
-    fs::create_dir_all(&codex_home).expect("create codex home");
+    let fx = Fixture::new();
+    let target_dir = fx.root.join("target_dir");
     fs::create_dir_all(&target_dir).expect("create target dir");
-
     let target_file = target_dir.join("matrix_target.txt");
-    let source_file = cwd.join("source.txt");
+    let sibling_tmp = target_dir.join("sibling.tmp");
+    let source_file = fx.cwd.join("source.txt");
     fs::write(&source_file, "source content").expect("write source");
-    assert!(!target_file.exists());
+    let profile = fx.profile_granting(&[&target_file]);
 
-    let profile = PermissionProfile::Managed {
-        file_system: ManagedFileSystemPermissions::Restricted {
-            entries: vec![
-                FileSystemSandboxEntry::new(
-                    FileSystemPath::Special {
-                        value: FileSystemSpecialPath::Root,
-                    },
-                    FileSystemAccessMode::Read,
-                ),
-                FileSystemSandboxEntry::new(
-                    FileSystemPath::Path {
-                        path: AbsolutePathBuf::from_absolute_path(&cwd).unwrap().into(),
-                    },
-                    FileSystemAccessMode::Write,
-                ),
-                FileSystemSandboxEntry::new(
-                    FileSystemPath::Path {
-                        path: AbsolutePathBuf::from_absolute_path(&target_file).unwrap().into(),
-                    },
-                    FileSystemAccessMode::Write,
-                ),
-            ],
-            glob_scan_max_depth: None,
-        },
-        network: NetworkSandboxPolicy::Restricted,
-    };
-
-    let env = setup_test_env(&cwd);
-    let workspace_roots = vec![AbsolutePathBuf::from_absolute_path(&cwd).unwrap()];
-
-    // Row 2: Copy-Item / overwrite onto target from readable source
-    let copy_cmd = vec![
-        "cmd.exe".to_string(),
-        "/c".to_string(),
-        format!("copy /Y \"{}\" \"{}\"", source_file.display(), target_file.display()),
-    ];
-
-    let result = run_windows_sandbox_capture(
+    // Row 2: copy-overwrite onto the placeholder.
+    let result = fx.run_script(
         &profile,
-        workspace_roots.as_slice(),
-        &codex_home,
-        copy_cmd,
-        &cwd,
-        env.clone(),
-        Some(30_000),
-        None,
-    )
-    .expect("run copy command");
-
-    assert_eq!(result.exit_code, 0, "copy command must succeed");
+        "copy-overwrite",
+        "copy /Y \"%SOURCE%\" \"%TARGET%\" >nul\r\nexit /b %ERRORLEVEL%\r\n",
+        &[("SOURCE", &source_file), ("TARGET", &target_file)],
+    );
+    assert_eq!(result.exit_code, 0, "copy-overwrite must succeed: {}", output(&result));
     assert_eq!(fs::read_to_string(&target_file).unwrap().trim(), "source content");
 
-    // Row 3: Atomic sibling temp file + rename in ungranted parent -> denied
-    let rename_cmd = vec![
-        "cmd.exe".to_string(),
-        "/c".to_string(),
-        format!("echo tmp > \"{}\" && move /Y \"{}\" \"{}\"",
-            target_dir.join("sibling.tmp").display(),
-            target_dir.join("sibling.tmp").display(),
-            target_file.display()
-        ),
-    ];
-
-    let rename_res = run_windows_sandbox_capture(
+    // Row 3: temp-file + rename needs a sibling create in the ungranted parent.
+    let result = fx.run_script(
         &profile,
-        workspace_roots.as_slice(),
-        &codex_home,
-        rename_cmd,
-        &cwd,
-        env.clone(),
-        Some(30_000),
-        None,
-    )
-    .expect("run rename command");
-    assert_ne!(rename_res.exit_code, 0, "sibling creation in ungranted parent must fail");
+        "sibling-create",
+        "echo tmp> \"%SIBLING%\"\r\nexit /b %ERRORLEVEL%\r\n",
+        &[("SIBLING", &sibling_tmp)],
+    );
+    assert_ne!(result.exit_code, 0, "sibling create must fail: {}", output(&result));
+    assert!(!sibling_tmp.exists(), "sibling.tmp must not be created");
 
-    // Row 4: Delete + recreate in ungranted parent -> recreate fails
-    let delete_recreate_cmd = vec![
-        "cmd.exe".to_string(),
-        "/c".to_string(),
-        format!("del /F \"{}\" && echo recreated > \"{}\"",
-            target_file.display(),
-            target_file.display()
-        ),
-    ];
-
-    let del_res = run_windows_sandbox_capture(
+    // Row 4, within one command: delete succeeds (DELETE is on the file ACE),
+    // recreate fails (needs FILE_ADD_FILE on the ungranted parent).
+    // Exit 2 = delete failed, 1 = recreate failed, 0 = recreate succeeded.
+    let result = fx.run_script(
         &profile,
-        workspace_roots.as_slice(),
-        &codex_home,
-        delete_recreate_cmd,
-        &cwd,
-        env,
-        Some(30_000),
-        None,
-    )
-    .expect("run delete recreate command");
-    assert_ne!(del_res.exit_code, 0, "recreation after deletion must fail because parent lacks FILE_ADD_FILE");
+        "delete-recreate",
+        concat!(
+            "del /F /Q \"%TARGET%\"\r\n",
+            "if exist \"%TARGET%\" exit /b 2\r\n",
+            "echo recreated> \"%TARGET%\"\r\n",
+            "if exist \"%TARGET%\" exit /b 0\r\n",
+            "exit /b 1\r\n",
+        ),
+        &[("TARGET", &target_file)],
+    );
+    assert_eq!(result.exit_code, 1, "delete ok, recreate denied: {}", output(&result));
+    assert!(!target_file.exists(), "target must not be recreated");
 }
 
 #[test]
 fn test_missing_directory_pinning_58118() {
-    let tmp = TempDir::new().expect("tempdir");
-    let cwd = tmp.path().join("workspace");
-    let codex_home = tmp.path().join("codex-home");
-    let missing_dir = tmp.path().join("new_agent_dir");
-    fs::create_dir_all(&cwd).expect("create cwd");
-    fs::create_dir_all(&codex_home).expect("create codex home");
+    let fx = Fixture::new();
+    let missing_dir = fx.root.join("new_agent_dir");
     assert!(!missing_dir.exists());
+    let profile = fx.profile_granting(&[&missing_dir]);
 
-    // Option 1 pins the behavior for missing directory roots without descendant entries:
-    // a 0-byte file is created, so mkdir in the child fails with AlreadyExists
-    let profile = PermissionProfile::Managed {
-        file_system: ManagedFileSystemPermissions::Restricted {
-            entries: vec![
-                FileSystemSandboxEntry::new(
-                    FileSystemPath::Special {
-                        value: FileSystemSpecialPath::Root,
-                    },
-                    FileSystemAccessMode::Read,
-                ),
-                FileSystemSandboxEntry::new(
-                    FileSystemPath::Path {
-                        path: AbsolutePathBuf::from_absolute_path(&cwd).unwrap().into(),
-                    },
-                    FileSystemAccessMode::Write,
-                ),
-                FileSystemSandboxEntry::new(
-                    FileSystemPath::Path {
-                        path: AbsolutePathBuf::from_absolute_path(&missing_dir).unwrap().into(),
-                    },
-                    FileSystemAccessMode::Write,
-                ),
-            ],
-            glob_scan_max_depth: None,
-        },
-        network: NetworkSandboxPolicy::Restricted,
-    };
-
-    let env = setup_test_env(&cwd);
-    let workspace_roots = vec![AbsolutePathBuf::from_absolute_path(&cwd).unwrap()];
-
-    let mkdir_cmd = vec![
-        "cmd.exe".to_string(),
-        "/c".to_string(),
-        format!("mkdir \"{}\"", missing_dir.display()),
-    ];
-
-    let result = run_windows_sandbox_capture(
+    // Option 1 pins today's behavior for a missing directory grant outside any
+    // writable root: it is materialized as a 0-byte file, so mkdir fails.
+    let result = fx.run_script(
         &profile,
-        workspace_roots.as_slice(),
-        &codex_home,
-        mkdir_cmd,
-        &cwd,
-        env,
-        Some(30_000),
-        None,
-    )
-    .expect("run mkdir command");
-
-    // Under Option 1, missing_dir was materialized as a file, so mkdir fails with "already exists"
-    let stderr = String::from_utf8_lossy(&result.stderr);
-    let stdout = String::from_utf8_lossy(&result.stdout);
-    assert!(
-        stderr.to_lowercase().contains("already exists") || stdout.to_lowercase().contains("already exists"),
-        "Option 1 pinning: mkdir on unscoped missing directory grant fails with AlreadyExists: stderr={stderr}, stdout={stdout}"
+        "mkdir-grant",
+        "mkdir \"%TARGET%\"\r\nexit /b %ERRORLEVEL%\r\n",
+        &[("TARGET", &missing_dir)],
     );
+    assert_ne!(result.exit_code, 0, "mkdir must fail: {}", output(&result));
+    assert!(missing_dir.is_file(), "grant must be materialized as a file");
+    assert_eq!(fs::metadata(&missing_dir).unwrap().len(), 0);
 }
