@@ -217,10 +217,10 @@ impl ResolvedWindowsSandboxPermissions {
                 continue;
             }
             // Enforce ReadDenyMatcher (e.g. **/*.env deny globs)
-            if let Some(ref matcher) = deny_matcher {
-                if matcher.is_local_path_read_denied(&candidate) {
-                    continue;
-                }
+            if let Some(ref matcher) = deny_matcher
+                && matcher.is_local_path_read_denied(&candidate)
+            {
+                continue;
             }
             // Enforce policy write permission
             if !self.file_system.can_write_local_path_with_cwd(&candidate, cwd) {

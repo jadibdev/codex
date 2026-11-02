@@ -246,6 +246,7 @@ pub(crate) fn materialize_missing_write_target_placeholders(
     guard
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn prepare_spawn_context_common(
     permission_profile: &PermissionProfile,
     workspace_roots: &[AbsolutePathBuf],
@@ -295,6 +296,7 @@ pub(crate) fn prepare_spawn_context_common(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn prepare_legacy_spawn_context(
     permission_profile: &PermissionProfile,
     workspace_roots: &[AbsolutePathBuf],
@@ -1051,7 +1053,7 @@ mod tests {
         let target = non_existent_parent.join("file.txt");
 
         let profile = PermissionProfile::Managed {
-            file_system: codex_protocol::permissions::ManagedFileSystemPermissions::Restricted {
+            file_system: codex_protocol::models::ManagedFileSystemPermissions::Restricted {
                 entries: vec![
                     codex_protocol::permissions::FileSystemSandboxEntry::new(
                         codex_protocol::permissions::FileSystemPath::Special {
@@ -1093,7 +1095,7 @@ mod tests {
         std::fs::write(&existing_file, "existing file content").expect("write existing");
 
         let profile = PermissionProfile::Managed {
-            file_system: codex_protocol::permissions::ManagedFileSystemPermissions::Restricted {
+            file_system: codex_protocol::models::ManagedFileSystemPermissions::Restricted {
                 entries: vec![
                     codex_protocol::permissions::FileSystemSandboxEntry::new(
                         codex_protocol::permissions::FileSystemPath::Special {
