@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
@@ -137,18 +139,19 @@ fn test_end_to_end_missing_write_grant_reproduction_issue_58433() {
     let result = fx.run_script(
         &profile,
         "write-brief",
-        "echo hello from sandbox> \"%TARGET%\"\r\nexit /b %ERRORLEVEL%\r\n",
+        "echo hello from sandbox> \"%TARGET%\"\r\nif exist \"%TARGET%\" exit /b 0\r\nexit /b 1\r\n",
         &[("TARGET", &brief_docx)],
     );
     assert_eq!(result.exit_code, 0, "approved write must succeed: {}", output(&result));
     let content = fs::read_to_string(&brief_docx).expect("read brief.docx");
     assert!(content.contains("hello from sandbox"), "content: {content}");
 
-    // A sibling in the same ungranted directory stays denied.
+    // A sibling in the same ungranted directory stays denied. A failed `>`
+    // redirection does not set ERRORLEVEL, so report via `if exist`.
     let result = fx.run_script(
         &profile,
         "write-sibling",
-        "echo evil> \"%TARGET%\"\r\nexit /b %ERRORLEVEL%\r\n",
+        "echo evil> \"%TARGET%\"\r\nif exist \"%TARGET%\" exit /b 0\r\nexit /b 1\r\n",
         &[("TARGET", &forbidden_file)],
     );
     assert_ne!(result.exit_code, 0, "sibling write must fail: {}", output(&result));
@@ -180,7 +183,7 @@ fn test_write_pattern_compatibility_matrix() {
     let result = fx.run_script(
         &profile,
         "sibling-create",
-        "echo tmp> \"%SIBLING%\"\r\nexit /b %ERRORLEVEL%\r\n",
+        "echo tmp> \"%SIBLING%\"\r\nif exist \"%SIBLING%\" exit /b 0\r\nexit /b 1\r\n",
         &[("SIBLING", &sibling_tmp)],
     );
     assert_ne!(result.exit_code, 0, "sibling create must fail: {}", output(&result));
