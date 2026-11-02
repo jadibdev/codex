@@ -94,7 +94,7 @@ pub fn create_windows_sandbox_command_args_for_permission_profile(
         args.push(WORKSPACE_ROOT_FLAG.to_string());
         args.push(root.as_path().to_string_lossy().into_owned());
     }
-    let desktop_name = {
+    let (desktop_name, mut placeholder_guard) = {
         // The caller owns the cache so the desktop survives this short-lived wrapper.
         let mut desktop_env = env_map.clone();
         let deny_write_paths = deny_write_paths_override
@@ -109,6 +109,7 @@ pub fn create_windows_sandbox_command_args_for_permission_profile(
                 command_cwd.as_path(),
                 &mut desktop_env,
                 &command,
+                &deny_write_paths,
                 SpawnPrepOptions {
                     inherit_path: true,
                     add_git_safe_directory: true,
@@ -162,11 +163,14 @@ pub fn create_windows_sandbox_command_args_for_permission_profile(
                 &cap_sids,
                 network_proxy_restricting_sid,
             )?;
-            shared_private_desktop_for_user(
-                &sandbox_creds.username,
-                &policy,
-                common.logs_base_dir.as_deref(),
-            )?
+            (
+                shared_private_desktop_for_user(
+                    &sandbox_creds.username,
+                    &policy,
+                    common.logs_base_dir.as_deref(),
+                )?,
+                common.placeholder_guard,
+            )
         } else {
             let common = prepare_legacy_spawn_context(
                 permission_profile,
@@ -175,6 +179,7 @@ pub fn create_windows_sandbox_command_args_for_permission_profile(
                 command_cwd.as_path(),
                 &mut desktop_env,
                 &command,
+                &deny_write_paths,
                 SpawnPrepOptions {
                     inherit_path: false,
                     add_git_safe_directory: false,
@@ -203,7 +208,7 @@ pub fn create_windows_sandbox_command_args_for_permission_profile(
             unsafe {
                 CloseHandle(security.h_token);
             }
-            desktop_name?
+            (desktop_name?, common.placeholder_guard)
         }
     };
     args.push(PRIVATE_DESKTOP_NAME_FLAG.to_string());
@@ -246,11 +251,13 @@ pub fn create_windows_sandbox_command_args_for_permission_profile(
     let payload = serde_json::to_string(&args[1..])?;
     if crate::launch_environment::needs_environment(&payload) {
         crate::environment_transport::encode(&payload, env_map)?;
+        placeholder_guard.commit();
         return Ok(vec![
             CODEX_WINDOWS_SANDBOX_ARG1.to_string(),
             crate::launch_environment::ARG.to_string(),
         ]);
     }
+    placeholder_guard.commit();
     Ok(args)
 }
 

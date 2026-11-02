@@ -1,0 +1,115 @@
+# Fork-only test harness for openai/codex#58433. Not intended for upstream.
+# Runs the codex-windows-sandbox crate on a GitHub-hosted Windows runner so
+# the heavy dependency fetch (rusty_v8 + Chromium submodules) happens in the
+# datacenter, and saves full logs as an artifact.
+name: windows-sandbox-58433
+
+on:
+  push:
+    branches:
+      - "ci/windows-sandbox-58433"
+  workflow_dispatch:
+
+concurrency:
+  group: windows-sandbox-58433-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+        working-directory: codex-rs
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_TERM_COLOR: never
+      RUST_BACKTRACE: "1"
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      # Same setup upstream CI uses: Dev Drive build root, Git CLI for Cargo
+      # git dependencies, and Git long paths.
+      - uses: ./.github/actions/setup-ci
+
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          components: clippy, rustfmt
+
+      - name: Record environment
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/logs"
+          {
+            echo "commit: ${GITHUB_SHA}"
+            rustc --version
+            cargo --version
+            whoami
+            net session >/dev/null 2>&1 && echo "elevated: yes" || echo "elevated: no"
+            cmd //c ver
+          } 2>&1 | tee "${RUNNER_TEMP}/logs/00-environment.log"
+
+      - name: Fetch dependencies
+        run: |
+          set -euo pipefail
+          cargo fetch 2>&1 | tee "${RUNNER_TEMP}/logs/01-fetch.log"
+
+      - name: rustfmt check (codex-windows-sandbox)
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          cargo fmt -p codex-windows-sandbox -- --check 2>&1 | tee "${RUNNER_TEMP}/logs/02-fmt.log"
+
+      - name: Build sandbox helper binaries
+        run: |
+          set -euo pipefail
+          cargo build -p codex-windows-sandbox \
+            --bin codex-windows-sandbox-setup \
+            --bin codex-command-runner 2>&1 | tee "${RUNNER_TEMP}/logs/03-build-helpers.log"
+
+      - name: clippy (codex-windows-sandbox, tests included)
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          cargo clippy -p codex-windows-sandbox --tests 2>&1 | tee "${RUNNER_TEMP}/logs/04-clippy.log"
+
+      - name: Test codex-windows-sandbox
+        run: |
+          set -euo pipefail
+          # setup-ci points TEMP at the ReFS Dev Drive; run the ACL/placeholder
+          # tests on the runner's NTFS temp instead, matching user machines.
+          ntfs_tmp="${RUNNER_TEMP}/ntfs-tmp"
+          mkdir -p "${ntfs_tmp}"
+          export TEMP="$(cygpath -w "${ntfs_tmp}")" TMP="$(cygpath -w "${ntfs_tmp}")"
+          powershell -NoProfile -Command "(Get-Volume -FilePath '${TEMP}').FileSystemType" \
+            | sed 's/^/test temp filesystem: /' | tee -a "${RUNNER_TEMP}/logs/00-environment.log" || true
+          helper_dir="${CARGO_TARGET_DIR}/debug"
+          export CARGO_BIN_EXE_codex_windows_sandbox_setup="$(cygpath -w "${helper_dir}/codex-windows-sandbox-setup.exe")"
+          export CARGO_BIN_EXE_codex_command_runner="$(cygpath -w "${helper_dir}/codex-command-runner.exe")"
+          cargo test -p codex-windows-sandbox --no-fail-fast -- --nocapture 2>&1 \
+            | tee "${RUNNER_TEMP}/logs/05-test.log"
+
+      - name: Summarize issue 58433 tests
+        if: always()
+        run: |
+          log="${RUNNER_TEMP}/logs/05-test.log"
+          {
+            echo "### codex-windows-sandbox tests"
+            echo '```'
+            grep -E "^test result:|^test .*(placeholder|candidates|missing_write|58433|58118|write_pattern|is_allowed_write_target)" "${log}" || echo "no test log"
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: windows-sandbox-58433-logs
+          path: ${{ runner.temp }}/logs/
+          if-no-files-found: warn

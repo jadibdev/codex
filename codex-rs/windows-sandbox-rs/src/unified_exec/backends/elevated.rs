@@ -226,6 +226,7 @@ pub(crate) async fn spawn_windows_sandbox_session_elevated_for_permission_profil
         proxy_settings_mode,
     };
     let transport = spawn_runner_transport_task(sandbox_creds, request).await?;
+    elevated.placeholder_guard.commit();
     let (pipe_write, pipe_read) = transport.into_files();
 
     let (writer_tx, writer_rx) = mpsc::channel::<Vec<u8>>(128);

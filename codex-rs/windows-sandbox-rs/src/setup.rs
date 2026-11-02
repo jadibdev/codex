@@ -1476,6 +1476,33 @@ fn filter_sensitive_write_roots(mut roots: Vec<PathBuf>, codex_home: &Path) -> V
     roots
 }
 
+pub(crate) fn is_allowed_write_target_path(candidate: &Path, codex_home: &Path) -> bool {
+    let user_profile = std::env::var_os("USERPROFILE").map(PathBuf::from);
+    is_allowed_write_target_path_with_user_profile(candidate, codex_home, user_profile.as_deref())
+}
+
+pub(crate) fn is_allowed_write_target_path_with_user_profile(
+    candidate: &Path,
+    codex_home: &Path,
+    user_profile: Option<&Path>,
+) -> bool {
+    if let Some(user_profile) = user_profile {
+        let user_profile_key = canonical_path_key(user_profile);
+        if canonical_path_key(candidate) == user_profile_key {
+            return false;
+        }
+        if is_user_profile_root_exclusion(candidate, user_profile) {
+            return false;
+        }
+        let dependency_paths = ssh_config_dependency_paths(user_profile);
+        if is_ssh_config_dependency_root(candidate, user_profile, &dependency_paths) {
+            return false;
+        }
+    }
+    let sensitive_filtered = filter_sensitive_write_roots(vec![candidate.to_path_buf()], codex_home);
+    !sensitive_filtered.is_empty()
+}
+
 #[cfg(test)]
 mod tests {
     use super::WINDOWS_PLATFORM_DEFAULT_READ_ROOTS;
@@ -2753,5 +2780,55 @@ mod tests {
             super::build_payload_deny_read_paths(Some(vec![existing.clone(), missing.clone()])),
             vec![existing, missing]
         );
+    }
+
+    #[test]
+    fn is_allowed_write_target_path_respects_user_profile_and_sensitive_filters() {
+        let tmp = TempDir::new().expect("tempdir");
+        let codex_home = tmp.path().join("codex-home");
+        let user_profile = tmp.path().join("user-profile");
+        fs::create_dir_all(&codex_home).expect("create codex home");
+        fs::create_dir_all(&user_profile).expect("create user profile");
+
+        let allowed_file = user_profile.join("Documents").join("brief.docx");
+        assert!(super::is_allowed_write_target_path_with_user_profile(
+            &allowed_file,
+            &codex_home,
+            Some(&user_profile),
+        ));
+
+        // User profile root itself must be rejected
+        assert!(!super::is_allowed_write_target_path_with_user_profile(
+            &user_profile,
+            &codex_home,
+            Some(&user_profile),
+        ));
+
+        // USERPROFILE_ROOT_EXCLUSIONS (.ssh, .aws, .gnupg) must be rejected
+        let ssh_key = user_profile.join(".ssh").join("authorized_keys");
+        assert!(!super::is_allowed_write_target_path_with_user_profile(
+            &ssh_key,
+            &codex_home,
+            Some(&user_profile),
+        ));
+        let aws_cred = user_profile.join(".aws").join("credentials");
+        assert!(!super::is_allowed_write_target_path_with_user_profile(
+            &aws_cred,
+            &codex_home,
+            Some(&user_profile),
+        ));
+
+        // CODEX_HOME and internal dirs must be rejected
+        assert!(!super::is_allowed_write_target_path_with_user_profile(
+            &codex_home,
+            &codex_home,
+            Some(&user_profile),
+        ));
+        let sandbox_secret = codex_home.join(".sandbox-secrets").join("token.json");
+        assert!(!super::is_allowed_write_target_path_with_user_profile(
+            &sandbox_secret,
+            &codex_home,
+            Some(&user_profile),
+        ));
     }
 }

@@ -21,6 +21,7 @@ use std::path::PathBuf;
 pub struct ResolvedWindowsSandboxPermissions {
     file_system: FileSystemSandboxPolicy,
     network: NetworkSandboxPolicy,
+    pub(crate) workspace_roots: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,6 +77,7 @@ impl ResolvedWindowsSandboxPermissions {
         Ok(Self {
             file_system,
             network,
+            workspace_roots: Vec::new(),
         })
     }
 
@@ -89,6 +91,10 @@ impl ResolvedWindowsSandboxPermissions {
         permissions.file_system = permissions
             .file_system
             .materialize_project_roots_with_workspace_roots(workspace_roots);
+        permissions.workspace_roots = workspace_roots
+            .iter()
+            .map(|p| p.as_path().to_path_buf())
+            .collect();
         Ok(permissions)
     }
 
@@ -169,6 +175,62 @@ impl ResolvedWindowsSandboxPermissions {
                     .collect(),
             })
             .collect()
+    }
+
+    pub(crate) fn explicit_missing_write_target_candidates(&self, cwd: &Path) -> Vec<PathBuf> {
+        let deny_matcher = ReadDenyMatcher::try_new_for_local_paths(&self.file_system, cwd)
+            .ok()
+            .flatten();
+
+        let mut candidates = Vec::new();
+        for entry in &self.file_system.entries {
+            if !entry.access.can_write() || entry.skips_missing_path() {
+                continue;
+            }
+            let FileSystemPath::Path { path } = &entry.path else {
+                continue;
+            };
+            let candidate = path.to_path_buf();
+            let candidate = if candidate.is_relative() {
+                cwd.join(candidate)
+            } else {
+                candidate
+            };
+            if candidate == cwd || self.workspace_roots.iter().any(|root| root == &candidate) {
+                continue;
+            }
+            // Deterministic scoped-directory guard: skip if candidate has descendant entries
+            let has_descendants = self.file_system.entries.iter().any(|other| {
+                if let FileSystemPath::Path { path: other_path } = &other.path {
+                    let other_buf = other_path.to_path_buf();
+                    let other_buf = if other_buf.is_relative() {
+                        cwd.join(other_buf)
+                    } else {
+                        other_buf
+                    };
+                    other_buf.starts_with(&candidate) && other_buf != candidate
+                } else {
+                    false
+                }
+            });
+            if has_descendants {
+                continue;
+            }
+            // Enforce ReadDenyMatcher (e.g. **/*.env deny globs)
+            if let Some(ref matcher) = deny_matcher {
+                if matcher.is_local_path_read_denied(&candidate) {
+                    continue;
+                }
+            }
+            // Enforce policy write permission
+            if !self.file_system.can_write_local_path_with_cwd(&candidate, cwd) {
+                continue;
+            }
+            if !candidates.contains(&candidate) {
+                candidates.push(candidate);
+            }
+        }
+        candidates
     }
 }
 
@@ -679,5 +741,139 @@ mod tests {
             err.to_string()
                 .contains("full-disk filesystem writes, which cannot be enforced")
         );
+    }
+
+    #[test]
+    fn candidates_extracts_missing_file_grant() {
+        let dir = TempDir::new().unwrap();
+        let cwd = dir.path().join("work");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let target = dir.path().join("brief.docx");
+        assert!(!target.exists());
+
+        let profile = permission_profile_with_entries(vec![
+            FileSystemSandboxEntry::new(
+                FileSystemPath::Special {
+                    value: FileSystemSpecialPath::Root,
+                },
+                FileSystemAccessMode::Read,
+            ),
+            FileSystemSandboxEntry::new(
+                FileSystemPath::Path {
+                    path: AbsolutePathBuf::from_absolute_path(&target)
+                        .unwrap()
+                        .into(),
+                },
+                FileSystemAccessMode::Write,
+            ),
+        ]);
+        let permissions =
+            ResolvedWindowsSandboxPermissions::try_from_permission_profile(&profile).unwrap();
+        let candidates = permissions.explicit_missing_write_target_candidates(&cwd);
+        assert_eq!(candidates, vec![target]);
+    }
+
+    #[test]
+    fn candidates_excludes_skips_missing_path() {
+        let dir = TempDir::new().unwrap();
+        let cwd = dir.path().join("work");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let target = dir.path().join("skipped.txt");
+        assert!(!target.exists());
+
+        let profile = permission_profile_with_entries(vec![
+            FileSystemSandboxEntry::new(
+                FileSystemPath::Special {
+                    value: FileSystemSpecialPath::Root,
+                },
+                FileSystemAccessMode::Read,
+            ),
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Path {
+                    path: AbsolutePathBuf::from_absolute_path(&target)
+                        .unwrap()
+                        .into(),
+                },
+                access: FileSystemAccessMode::Write,
+                missing_path_behavior: Some(codex_protocol::permissions::FileSystemSandboxEntryMissingPathBehavior::Skip),
+            },
+        ]);
+        let permissions =
+            ResolvedWindowsSandboxPermissions::try_from_permission_profile(&profile).unwrap();
+        let candidates = permissions.explicit_missing_write_target_candidates(&cwd);
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn candidates_excludes_descendant_directory_roots() {
+        let dir = TempDir::new().unwrap();
+        let cwd = dir.path().join("work");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let dir_target = dir.path().join("new_dir");
+        let child_target = dir_target.join(".git");
+
+        let profile = permission_profile_with_entries(vec![
+            FileSystemSandboxEntry::new(
+                FileSystemPath::Special {
+                    value: FileSystemSpecialPath::Root,
+                },
+                FileSystemAccessMode::Read,
+            ),
+            FileSystemSandboxEntry::new(
+                FileSystemPath::Path {
+                    path: AbsolutePathBuf::from_absolute_path(&dir_target)
+                        .unwrap()
+                        .into(),
+                },
+                FileSystemAccessMode::Write,
+            ),
+            FileSystemSandboxEntry::new(
+                FileSystemPath::Path {
+                    path: AbsolutePathBuf::from_absolute_path(&child_target)
+                        .unwrap()
+                        .into(),
+                },
+                FileSystemAccessMode::Deny,
+            ),
+        ]);
+        let permissions =
+            ResolvedWindowsSandboxPermissions::try_from_permission_profile(&profile).unwrap();
+        let candidates = permissions.explicit_missing_write_target_candidates(&cwd);
+        assert!(candidates.is_empty(), "directory root with descendants must be excluded");
+    }
+
+    #[test]
+    fn candidates_excludes_read_deny_matcher_globs() {
+        let dir = TempDir::new().unwrap();
+        let cwd = dir.path().join("work");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let target = dir.path().join("secret.env");
+
+        let profile = permission_profile_with_entries(vec![
+            FileSystemSandboxEntry::new(
+                FileSystemPath::Special {
+                    value: FileSystemSpecialPath::Root,
+                },
+                FileSystemAccessMode::Read,
+            ),
+            FileSystemSandboxEntry::new(
+                FileSystemPath::Path {
+                    path: AbsolutePathBuf::from_absolute_path(&target)
+                        .unwrap()
+                        .into(),
+                },
+                FileSystemAccessMode::Write,
+            ),
+            FileSystemSandboxEntry::new(
+                FileSystemPath::GlobPattern {
+                    pattern: "**/*.env".to_string(),
+                },
+                FileSystemAccessMode::Deny,
+            ),
+        ]);
+        let permissions =
+            ResolvedWindowsSandboxPermissions::try_from_permission_profile(&profile).unwrap();
+        let candidates = permissions.explicit_missing_write_target_candidates(&cwd);
+        assert!(candidates.is_empty(), "deny glob matching file must be excluded");
     }
 }

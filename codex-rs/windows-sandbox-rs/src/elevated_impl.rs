@@ -130,6 +130,12 @@ mod windows_impl {
             .iter()
             .map(AbsolutePathBuf::to_path_buf)
             .collect::<Vec<_>>();
+        let mut placeholder_guard = crate::spawn_prep::materialize_missing_write_target_placeholders(
+            &permissions,
+            cwd,
+            codex_home,
+            &deny_write_paths_override,
+        );
         normalize_null_device_env(&mut env_map);
         ensure_non_interactive_pager(&mut env_map);
         inherit_path_env(&mut env_map);
@@ -244,6 +250,7 @@ mod windows_impl {
                     )
                 },
             )?;
+            placeholder_guard.commit();
             let (pipe_write, mut pipe_read) = transport.into_files();
             let cancel_writer = spawn_cancel_writer(&pipe_write, cancellation)?;
 
