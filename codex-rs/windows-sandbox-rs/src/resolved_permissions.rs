@@ -79,6 +79,7 @@ impl ResolvedWindowsSandboxPermissions {
         Ok(Self {
             file_system,
             network,
+            // Filled by `try_from_permission_profile_for_workspace_roots`, which every spawn path uses.
             workspace_roots: Vec::new(),
         })
     }

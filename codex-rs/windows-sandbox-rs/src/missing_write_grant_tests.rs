@@ -292,6 +292,15 @@ fn test_spawn_failure_rolls_back_placeholder() {
         !target.exists(),
         "placeholder must be rolled back when spawn fails"
     );
+    // Proves a placeholder was created and then removed, not merely that
+    // nothing was ever created.
+    let log_path = crate::current_log_file_path(&fx.codex_home.join(".sandbox"));
+    let log = fs::read_to_string(&log_path).unwrap_or_default();
+    assert!(
+        log.contains(&format!("placeholder rolled back: {}", target.display())),
+        "rollback must be logged in {}: {log}",
+        log_path.display()
+    );
 }
 
 #[test]

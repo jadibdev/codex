@@ -10,6 +10,7 @@ on:
       - "ci/windows-sandbox-58433"
       # Gate 5 revert-proof: same tests with materialization disabled.
       - "ci/windows-sandbox-58433-revert"
+      - "ci/windows-sandbox-baseline"
   workflow_dispatch:
 
 concurrency:
@@ -118,6 +119,10 @@ jobs:
           helper_dir="${CARGO_TARGET_DIR}/debug"
           export CARGO_BIN_EXE_codex_windows_sandbox_setup="$(cygpath -w "${helper_dir}/codex-windows-sandbox-setup.exe")"
           export CARGO_BIN_EXE_codex_command_runner="$(cygpath -w "${helper_dir}/codex-command-runner.exe")"
+          # The elevated backend looks for the helpers next to current_exe(),
+          # which for cargo test binaries is target/debug/deps.
+          mkdir -p "${helper_dir}/deps"
+          cp "${helper_dir}/codex-windows-sandbox-setup.exe" "${helper_dir}/codex-command-runner.exe" "${helper_dir}/deps/"
           cargo test -p codex-windows-sandbox --no-fail-fast -- --nocapture 2>&1 \
             | tee "${RUNNER_TEMP}/logs/05-test.log"
 

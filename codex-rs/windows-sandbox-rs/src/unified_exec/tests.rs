@@ -354,6 +354,85 @@ fn elevated_non_tty_cmd_forwards_env_output_and_exit() {
 }
 
 #[test]
+fn elevated_approved_missing_file_outside_writable_roots_is_writable() {
+    // openai/codex#58433 on the elevated backend: an approved write to a file
+    // that does not exist yet, outside every writable root, must work, and a
+    // sibling in the same directory must stay denied.
+    let _account_guard =
+        WindowsSandboxAccountTestGuard::acquire().expect("lock Windows sandbox test accounts");
+    let _guard = legacy_process_test_guard();
+    let runtime = current_thread_runtime();
+    runtime.block_on(async move {
+        let cwd = sandbox_cwd();
+        let codex_home = sandbox_home("elevated-missing-write-grant");
+        let outside = TempDir::new().expect("outside dir");
+        let target = outside.path().join("brief.txt");
+        let sibling = outside.path().join("sibling.txt");
+        // The command line below passes paths unquoted.
+        assert!(!target.to_string_lossy().contains(' '), "{}", target.display());
+        let target_abs = AbsolutePathBuf::from_absolute_path(&target).expect("absolute target");
+        let permission_profile = PermissionProfile::workspace_write_with(
+            &[target_abs],
+            codex_protocol::permissions::NetworkSandboxPolicy::Restricted,
+            /*exclude_tmpdir_env_var*/ true,
+            /*exclude_slash_tmp*/ true,
+        );
+
+        let mut results = Vec::new();
+        for (name, path) in [("TARGET", &target), ("SIBLING", &sibling)] {
+            let env_map = HashMap::from([(name.to_string(), path.display().to_string())]);
+            let spawned = spawn_windows_sandbox_session_elevated_for_permission_profile(
+                &permission_profile,
+                workspace_roots_for(cwd.as_path()).as_slice(),
+                codex_home.path(),
+                vec![
+                    "C:\Windows\System32\cmd.exe".to_string(),
+                    "/d".to_string(),
+                    "/c".to_string(),
+                    format!("echo ELEVATED-58433> %{name}% & exit /b 0"),
+                ],
+                cwd.as_path(),
+                env_map,
+                /*proxy_enforced*/ false,
+                /*network_proxy_restricting_sid*/ None,
+                Some(10_000),
+                /*read_roots_override*/ None,
+                /*read_roots_include_platform_defaults*/ true,
+                /*write_roots_override*/ None,
+                &[],
+                &[],
+                /*tty*/ false,
+                /*stdin_open*/ false,
+            )
+            .await
+            .unwrap_or_else(|err| {
+                panic!(
+                    "spawn elevated {name} write: {err:#}\nsandbox log:\n{}",
+                    sandbox_log(codex_home.path())
+                )
+            });
+            results.push(
+                collect_stdout_and_exit(spawned, codex_home.path(), Duration::from_secs(15)).await,
+            );
+        }
+
+        let content = fs::read_to_string(&target).unwrap_or_else(|err| {
+            panic!(
+                "read {}: {err}\nresults={results:?}\nsandbox log:\n{}",
+                target.display(),
+                sandbox_log(codex_home.path())
+            )
+        });
+        assert!(
+            content.contains("ELEVATED-58433"),
+            "approved write must land: {content:?}\nsandbox log:\n{}",
+            sandbox_log(codex_home.path())
+        );
+        assert!(!sibling.exists(), "sibling write must stay denied");
+    });
+}
+
+#[test]
 #[ignore = "requires this test binary in an installed test MSIX, launched with package identity, CODEX_WINDOWS_REGISTERED_CORE=1, and CODEX_HOME provisioned by that package's service in a disposable Windows VM"]
 fn registered_non_tty_cmd_forwards_env_output_and_exit() {
     assert!(

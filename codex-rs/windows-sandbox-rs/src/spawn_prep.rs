@@ -111,15 +111,14 @@ impl Drop for PlaceholderRollbackGuard {
             return;
         }
         for (path, handle) in self.entries.iter().rev() {
-            if let Err(reason) = delete_placeholder_if_empty(handle) {
-                crate::logging::log_note(
-                    &format!(
-                        "placeholder rollback skipped for {}: {reason}",
-                        path.display()
-                    ),
-                    self.logs_base_dir.as_deref(),
-                );
-            }
+            let note = match delete_placeholder_if_empty(handle) {
+                Ok(()) => format!("placeholder rolled back: {}", path.display()),
+                Err(reason) => format!(
+                    "placeholder rollback skipped for {}: {reason}",
+                    path.display()
+                ),
+            };
+            crate::logging::log_note(&note, self.logs_base_dir.as_deref());
         }
     }
 }
