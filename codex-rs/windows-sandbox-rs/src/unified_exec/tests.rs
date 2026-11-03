@@ -386,7 +386,7 @@ fn elevated_approved_missing_file_outside_writable_roots_is_writable() {
                 workspace_roots_for(cwd.as_path()).as_slice(),
                 codex_home.path(),
                 vec![
-                    "C:\Windows\System32\cmd.exe".to_string(),
+                    "C:\\Windows\\System32\\cmd.exe".to_string(),
                     "/d".to_string(),
                     "/c".to_string(),
                     format!("echo ELEVATED-58433> %{name}% & exit /b 0"),
