@@ -40,6 +40,7 @@ use codex_features::Feature;
 use codex_mcp::CODEX_APPS_MCP_SERVER_NAME;
 use codex_mcp::MCP_TOOL_CODEX_APPS_META_KEY;
 use codex_mcp::McpPermissionPromptAutoApproveContext;
+use codex_mcp::McpPermissionSource;
 use codex_mcp::McpToolRequestMetaHook;
 use codex_mcp::PreparedMcpCall;
 use codex_mcp::SandboxState;
@@ -78,7 +79,6 @@ use codex_protocol::mcp_approval_meta::TOOL_NAME_KEY as MCP_TOOL_APPROVAL_TOOL_N
 use codex_protocol::mcp_approval_meta::TOOL_PARAMS_DISPLAY_KEY as MCP_TOOL_APPROVAL_TOOL_PARAMS_DISPLAY_KEY;
 use codex_protocol::mcp_approval_meta::TOOL_PARAMS_KEY as MCP_TOOL_APPROVAL_TOOL_PARAMS_KEY;
 use codex_protocol::mcp_approval_meta::TOOL_TITLE_KEY as MCP_TOOL_APPROVAL_TOOL_TITLE_KEY;
-use codex_protocol::models::PermissionProfile;
 use codex_protocol::openai_models::InputModality;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::McpInvocation;
@@ -292,7 +292,7 @@ pub(crate) async fn handle_mcp_tool_call(
         &hook_tool_name,
         &metadata,
         prepared_call.config(),
-        prepared_call.permission_profile(),
+        prepared_call.permission_source(),
         prepared_call.server_environment_id(),
         approval_policy,
     )
@@ -488,6 +488,39 @@ async fn handle_approved_mcp_tool_call(
     let mut tool_input = arguments_value
         .clone()
         .unwrap_or_else(|| JsonValue::Object(serde_json::Map::new()));
+    let is_search = prepared_call.is_host_owned_apps()
+        && codex_mcp::is_model_search_tool(prepared_call.tool_info());
+    let search = if is_search {
+        step_context
+            .extension_data
+            .get::<crate::model_search::ModelSearch>()
+    } else {
+        None
+    };
+    // Code Mode can retain this step past a later turn's first native call.
+    // A call rejected here never reaches the peer or acquires MCP attribution.
+    if matches!(
+        search.as_deref(),
+        Some(crate::model_search::ModelSearch::Hosted { .. })
+    ) && !crate::model_search::SearchOwner::admit(
+        &sess.services.thread_extension_data,
+        codex_protocol::openai_models::WebSearchProvider::SearchMcp,
+    ) {
+        let result = notify_mcp_tool_call_skip(
+            sess,
+            turn_context,
+            call_id,
+            invocation,
+            item_metadata,
+            "This thread is using native search".to_string(),
+            /*already_started*/ true,
+        )
+        .await;
+        return HandledMcpToolCall {
+            result: CallToolResult::from_result(result),
+            tool_input,
+        };
+    }
     let mut elicitation_type = None;
     let mut request_error_code = None;
     let result = async {
@@ -569,6 +602,32 @@ async fn handle_approved_mcp_tool_call(
                             serde_json::json!(turn_context.cyber_access_program),
                         );
                     }
+                    let request_meta = if let Some(crate::model_search::ModelSearch::Hosted {
+                        binding,
+                        context,
+                    }) = search.as_deref()
+                    {
+                        let mut meta = request_meta.unwrap_or_else(|| serde_json::json!({}));
+                        let turn_meta = meta
+                            .as_object_mut()
+                            .ok_or_else(|| anyhow::anyhow!("invalid MCP metadata"))?
+                            .entry(crate::X_CODEX_TURN_METADATA_HEADER)
+                            .or_insert_with(|| serde_json::json!({}));
+                        crate::model_search::with_search_context(turn_meta, context)?;
+                        let pin = binding
+                            .search_invocation_context(&prepared_call)
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("Search MCP connection changed after discovery")
+                            })?;
+                        let apps = meta
+                            .get_mut(MCP_TOOL_CODEX_APPS_META_KEY)
+                            .and_then(serde_json::Value::as_object_mut)
+                            .ok_or_else(|| anyhow::anyhow!("missing hosted Apps call metadata"))?;
+                        apps.insert("invocation_context".to_string(), pin.clone());
+                        Some(meta)
+                    } else {
+                        request_meta
+                    };
                     let request_meta = with_mcp_tool_call_ids_meta(
                         request_meta,
                         &sess.thread_id.to_string(),
@@ -581,6 +640,17 @@ async fn handle_approved_mcp_tool_call(
                         request_meta,
                     )
                     .await?;
+                    if is_search
+                        && let Some(usage) = step_context
+                            .turn
+                            .extension_data
+                            .get::<crate::model_search::SearchTurnUsage>()
+                    {
+                        usage.record(
+                            &step_context.turn,
+                            codex_protocol::openai_models::WebSearchProvider::SearchMcp,
+                        );
+                    }
                     let mcp_call_trace = sess
                         .services
                         .rollout_thread_trace
@@ -1557,7 +1627,7 @@ async fn maybe_request_mcp_tool_approval(
     hook_tool_name: &HookToolName,
     metadata: &McpToolApprovalMetadata,
     config: &codex_mcp::McpConfig,
-    permission_profile: &PermissionProfile,
+    permission_source: McpPermissionSource<'_>,
     environment_id: &str,
     policy: McpToolApprovalPolicy,
 ) -> Option<McpToolApproval> {
@@ -1577,7 +1647,7 @@ async fn maybe_request_mcp_tool_approval(
     if !strict_auto_review
         && mcp_permission_prompt_is_auto_approved(
             config.approval_policy.value(),
-            permission_profile,
+            permission_source.profile(),
             McpPermissionPromptAutoApproveContext {
                 tool_approval_mode: Some(policy.mode),
             },
@@ -1637,6 +1707,13 @@ async fn maybe_request_mcp_tool_approval(
         approval_mode: policy.mode,
         allow_session_remember: session_approval_key.is_some(),
         allow_persistent_approval: persistent_approval_key.is_some(),
+        prompt_permissions: match permission_source {
+            McpPermissionSource::Environment {
+                environment_id,
+                sandbox,
+            } => Some((environment_id.to_owned(), Arc::clone(sandbox))),
+            McpPermissionSource::Thread { .. } => None,
+        },
     };
     let approval_context = ApprovalContext {
         exec_requirement: None,
@@ -1779,7 +1856,7 @@ pub(crate) async fn request_mcp_tool_user_approval(
             cancellation_reason,
         )
     } else {
-        if turn_context.session_source.is_non_root_agent() {
+        if turn_context.root_capabilities_restricted {
             return ApprovalResolution {
                 decision: ReviewDecision::denied(concat!(
                     "MCP tool approval via request_user_input requires the root thread. ",
@@ -1898,6 +1975,7 @@ pub(crate) fn build_guardian_mcp_tool_review_request(
                 open_world_hint: annotations.open_world_hint,
                 read_only_hint: annotations.read_only_hint,
             }),
+        prompt_permissions: None,
     }
 }
 

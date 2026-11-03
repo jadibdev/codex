@@ -4,6 +4,7 @@ use super::token_budget::resolve_token_budget;
 use super::*;
 use crate::config::TokenBudgetConfig;
 use crate::cyber_access_program;
+use crate::environment_selection::EnvironmentAttachment;
 use crate::environment_selection::EnvironmentConfigOrigin;
 use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::exec_policy::AllowPrefixRules;
@@ -69,7 +70,7 @@ pub(crate) struct ShellSnapshotCacheKey {
 pub(crate) struct TurnEnvironment {
     pub(crate) selection: TurnEnvironmentSelection,
     pub(crate) config_origin: EnvironmentConfigOrigin,
-    pub(crate) environment: Arc<Environment>,
+    pub(crate) attachment: Arc<EnvironmentAttachment>,
     /// Cached from the selected executor; `None` means it did not report one.
     pub(crate) user_home_dir: Option<PathUri>,
     /// Cached from the selected executor; `None` means it did not report them.
@@ -84,17 +85,31 @@ pub(crate) struct TurnEnvironment {
 }
 
 impl TurnEnvironment {
+    #[cfg(test)]
     pub(crate) fn new(
         selection: TurnEnvironmentSelection,
         config_origin: EnvironmentConfigOrigin,
         environment: Arc<Environment>,
         shell: Option<shell::Shell>,
     ) -> Self {
+        let (attachment, guard, _) =
+            EnvironmentAttachment::new(&selection.environment_id, environment);
+        // Standalone test snapshots have no thread selection to signal detach.
+        guard.disarm();
+        Self::from_attachment(selection, config_origin, attachment, shell)
+    }
+
+    pub(crate) fn from_attachment(
+        selection: TurnEnvironmentSelection,
+        config_origin: EnvironmentConfigOrigin,
+        attachment: Arc<EnvironmentAttachment>,
+        shell: Option<shell::Shell>,
+    ) -> Self {
         debug_assert!(matches!(selection.config, EnvironmentConfigState::Ready(_)));
         Self {
             selection,
             config_origin,
-            environment,
+            attachment,
             user_home_dir: None,
             temporary_directories: None,
             shell,
@@ -104,6 +119,10 @@ impl TurnEnvironment {
             shell_snapshot_cache: Arc::default(),
             shell_snapshot_v2_supported: false,
         }
+    }
+
+    pub(crate) fn environment(&self) -> &Arc<Environment> {
+        &self.attachment.environment
     }
 
     pub(crate) fn config(&self) -> &EnvironmentConfig {
@@ -182,7 +201,7 @@ impl TurnEnvironment {
                     .as_ref()
                     .clone()
                     .build(
-                        Arc::clone(&self.environment),
+                        Arc::clone(self.environment()),
                         PathUri::from_abs_path(cwd),
                         Some(shell.clone()),
                         use_login_shell,
@@ -226,7 +245,7 @@ impl TurnEnvironment {
         additional_permissions: Option<AdditionalPermissionProfile>,
     ) -> impl EnvironmentAccess + '_ {
         FileSystemEnvironmentAccessor::new(
-            self.environment.filesystem_ref(),
+            self.environment().filesystem_ref(),
             self.sandbox_context(additional_permissions),
         )
     }
@@ -264,7 +283,7 @@ impl TurnEnvironment {
         &self,
     ) -> codex_file_system::WindowsSandboxSelection {
         let config = self.config();
-        if self.environment.is_remote() {
+        if self.environment().is_remote() {
             executor_windows_sandbox_selection(
                 config.windows_sandbox_type,
                 config.windows_sandbox_level,
@@ -299,7 +318,7 @@ impl std::fmt::Debug for TurnEnvironment {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TurnEnvironment")
             .field("environment_id", &self.selection.environment_id)
-            .field("environment", &self.environment)
+            .field("environment", self.environment())
             .field("cwd", &self.selection.cwd)
             .field("workspace_roots", &self.config().workspace_roots)
             .field("user_home_dir", &self.user_home_dir)
@@ -347,6 +366,7 @@ pub struct TurnContext {
     pub(crate) session_telemetry: SessionTelemetry,
     pub(crate) provider: SharedModelProvider,
     pub(crate) session_source: SessionSource,
+    pub(crate) root_capabilities_restricted: bool,
     pub(crate) history_mode: ThreadHistoryMode,
     pub(crate) parent_thread_id: Option<ThreadId>,
     pub(crate) originator: String,
@@ -437,6 +457,7 @@ impl TurnContext {
             session_telemetry,
             provider: self.provider.clone(),
             session_source: self.session_source.clone(),
+            root_capabilities_restricted: self.root_capabilities_restricted,
             history_mode: self.history_mode,
             parent_thread_id: self.parent_thread_id,
             originator: self.originator.clone(),
@@ -848,6 +869,7 @@ impl TurnContext {
             session_telemetry,
             provider: self.provider.clone(),
             session_source: self.session_source.clone(),
+            root_capabilities_restricted: self.root_capabilities_restricted,
             history_mode: self.history_mode,
             parent_thread_id: self.parent_thread_id,
             originator: self.originator.clone(),
@@ -1132,6 +1154,7 @@ impl Session {
             session_telemetry: session_telemetry_for_context,
             provider,
             session_source,
+            root_capabilities_restricted: session_configuration.root_capabilities_restricted,
             history_mode: session_configuration.history_mode,
             parent_thread_id: session_configuration.parent_thread_id,
             originator: session_configuration.originator.clone(),
@@ -1187,6 +1210,21 @@ impl Session {
         options: NewTurnContextOptions,
         should_start: impl FnOnce(&SessionConfiguration, &SessionConfiguration) -> bool + Send,
     ) -> CodexResult<Option<(Arc<TurnContext>, ThreadSettingsSnapshot)>> {
+        let refresh_client = {
+            let state = self.state.lock().await;
+            let configuration = &state.session_configuration;
+            (!crate::guardian::is_basic_session_source(&configuration.session_source)).then(|| {
+                self.build_effective_session_config(configuration)
+                    .http_client_factory()
+            })
+        };
+        // An auth refresh may change allowed settings; finish it before capturing this turn.
+        if let Some(http_client_factory) = refresh_client {
+            self.services
+                .models_manager
+                .refresh_after_auth_change(http_client_factory)
+                .await;
+        }
         let service_tier_for_turn = updates.service_tier_for_turn.clone();
         let commit = match self.update_settings_if(updates, should_start).await {
             Ok(Some(commit)) => commit,
@@ -1209,15 +1247,6 @@ impl Session {
         // Apply the override only to the turn's copy, after persisting thread settings.
         if let Some(service_tier) = service_tier_for_turn {
             Arc::make_mut(&mut configuration.step_settings).service_tier = Some(service_tier);
-        }
-        if !crate::guardian::is_basic_session_source(&configuration.session_source) {
-            self.services
-                .models_manager
-                .refresh_after_auth_change(
-                    self.build_effective_session_config(&configuration)
-                        .http_client_factory(),
-                )
-                .await;
         }
         let turn_environments = self.activate_turn_environments(&configuration).await;
         let turn_context = self

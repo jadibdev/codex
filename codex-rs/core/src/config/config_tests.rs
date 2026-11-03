@@ -493,8 +493,7 @@ web_search = true
         cfg.tools,
         Some(ToolsToml {
             web_search: None,
-            experimental_request_user_input: None,
-            update_plan: None,
+            ..Default::default()
         })
     );
 }
@@ -513,8 +512,7 @@ web_search = false
         cfg.tools,
         Some(ToolsToml {
             web_search: None,
-            experimental_request_user_input: None,
-            update_plan: None,
+            ..Default::default()
         })
     );
 }
@@ -531,9 +529,8 @@ fn tools_experimental_request_user_input_defaults_to_enabled() {
     assert_eq!(
         cfg.tools,
         Some(ToolsToml {
-            web_search: None,
             experimental_request_user_input: Some(ExperimentalRequestUserInput { enabled: true }),
-            update_plan: None,
+            ..Default::default()
         })
     );
 }
@@ -551,9 +548,8 @@ enabled = false
     assert_eq!(
         cfg.tools,
         Some(ToolsToml {
-            web_search: None,
             experimental_request_user_input: Some(ExperimentalRequestUserInput { enabled: false }),
-            update_plan: None,
+            ..Default::default()
         })
     );
 }
@@ -569,6 +565,7 @@ async fn load_config_resolves_experimental_request_user_input_enabled() -> std::
                     enabled: false,
                 }),
                 update_plan: None,
+                ..Default::default()
             }),
             ..ConfigToml::default()
         },
@@ -1393,6 +1390,7 @@ fn config_toml_deserializes_model_availability_nux() {
     assert_eq!(
         cfg.tui.expect("tui config should deserialize"),
         Tui {
+            default_hosts: Default::default(),
             notification_settings: TuiNotificationSettings::default(),
             animations: true,
             screen_reader_detection_done: None,
@@ -4754,6 +4752,7 @@ fn tui_config_missing_notifications_field_defaults_to_enabled() {
     assert_eq!(
         tui,
         Tui {
+            default_hosts: Default::default(),
             notification_settings: TuiNotificationSettings::default(),
             animations: true,
             screen_reader_detection_done: None,
@@ -8926,6 +8925,9 @@ async fn load_config_uses_auto_review_guardian_policy_config_and_template(
                 "  Configured template: {{ tenant_policy_config }}  ".to_string(),
             ),
             experimental_conversation_history_prompt: None,
+            experimental_denial_reconsideration_prompt: Some(
+                "  Reconsider this review carefully.  ".to_owned(),
+            ),
             conversation_history_max_output_tokens: None,
         }),
         ..Default::default()
@@ -8947,12 +8949,14 @@ async fn load_config_uses_auto_review_guardian_policy_config_and_template(
             config.guardian_policy_config.as_deref(),
             config.guardian_extra_policy.as_deref(),
             config.guardian_policy_template.as_deref(),
+            config.guardian_denial_reconsideration_prompt.as_deref(),
         ),
         (
             expected_mode,
             Some("Use the user-configured guardian policy."),
             Some("Use the user-configured additional policy."),
             Some("Configured template: {{ tenant_policy_config }}"),
+            Some("Reconsider this review carefully."),
         )
     );
 
@@ -8962,6 +8966,34 @@ async fn load_config_uses_auto_review_guardian_policy_config_and_template(
         features.contains("async_classifier_mode"),
     );
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn load_config_rejects_oversized_guardian_reconsideration_prompt() -> std::io::Result<()> {
+    let codex_home = TempDir::new()?;
+    let cfg = ConfigToml {
+        auto_review: Some(AutoReviewToml {
+            experimental_denial_reconsideration_prompt: Some("é".repeat(501)),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let error = Config::load_from_base_config_with_overrides(
+        cfg,
+        ConfigOverrides {
+            cwd: Some(codex_home.path().to_path_buf()),
+            ..Default::default()
+        },
+        codex_home.abs(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert_eq!(
+        error.to_string(),
+        "auto_review.experimental_denial_reconsideration_prompt exceeds 1,000 UTF-8 bytes"
+    );
     Ok(())
 }
 
@@ -8994,6 +9026,7 @@ async fn requirements_guardian_policy_beats_auto_review() -> std::io::Result<()>
                 extra_policy: Some("Use the user-configured additional policy.".to_string()),
                 experimental_policy_template: None,
                 experimental_conversation_history_prompt: None,
+                experimental_denial_reconsideration_prompt: None,
                 conversation_history_max_output_tokens: None,
             }),
             ..Default::default()
@@ -9036,6 +9069,7 @@ async fn load_config_ignores_empty_auto_review_guardian_policy_config() -> std::
             extra_policy: Some("   ".to_string()),
             experimental_policy_template: None,
             experimental_conversation_history_prompt: Some(String::new()),
+            experimental_denial_reconsideration_prompt: Some("  ".to_owned()),
             conversation_history_max_output_tokens: None,
         }),
         ..Default::default()
@@ -9056,8 +9090,9 @@ async fn load_config_ignores_empty_auto_review_guardian_policy_config() -> std::
             config.guardian_policy_config,
             config.guardian_extra_policy,
             config.guardian_conversation_history_prompt,
+            config.guardian_denial_reconsideration_prompt,
         ),
-        (None, None, None)
+        (None, None, None, None)
     );
 
     Ok(())
@@ -12363,6 +12398,7 @@ shell_tool = false
 
 #[test_case::test_case(Feature::Personality; "personality")]
 #[test_case::test_case(Feature::GuardianThreadContext; "guardian thread context")]
+#[test_case::test_case(Feature::DaemonAutoStart; "daemon auto start")]
 #[test_case::test_case(Feature::Worktrees; "worktrees")]
 #[test_case::test_case(Feature::RealtimeConversation; "realtime conversation")]
 #[test_case::test_case(Feature::ShellZshFork; "shell zsh fork")]

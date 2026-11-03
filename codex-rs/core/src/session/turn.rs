@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -946,7 +947,7 @@ async fn turn_diff_display_roots(step_context: &StepContext) -> Vec<(String, Pat
         // A turn cwd is expected to be a directory. If it is a file, the failed `<cwd>/.git` probe
         // is ignored and ancestor search continues from its parent.
         let root = find_nearest_ancestor_with_markers(
-            turn_environment.environment.get_filesystem().as_ref(),
+            turn_environment.environment().get_filesystem().as_ref(),
             cwd,
             vec![".git".to_string()],
             FindUpErrorPolicy::Ignore,
@@ -969,55 +970,22 @@ pub(crate) async fn run_hooks_and_record_inputs(
     input: &[TurnInput],
     persist_context: PersistContext,
 ) -> CodexResult<bool> {
-    let rejected_uploaded_audio = input.iter().any(turn_input_has_uploaded_audio_file);
-    // Cancellation can reach this path before Guardian's tools and context are
-    // resolved. Only finalized evidence may enter reusable reviewer history.
-    if sess
-        .services
-        .thread_extension_data
-        .get::<crate::guardian::PendingReviewContext>()
-        .is_some()
-    {
-        return if rejected_uploaded_audio {
-            Err(uploaded_audio_disabled_error())
-        } else {
-            Ok(false)
-        };
-    }
     let mut blocked_input = false;
     let mut accepted_user_input = false;
-    for input_item in input {
-        let filtered_input;
-        let input_item = match input_item {
-            TurnInput::UserInput { content, .. } if content.iter().any(is_uploaded_audio_file) => {
-                let mut filtered = input_item.clone();
-                let TurnInput::UserInput { content, .. } = &mut filtered else {
-                    unreachable!("cloned user input must remain user input");
-                };
-                content.retain(|item| !is_uploaded_audio_file(item));
-                if content.is_empty() {
-                    continue;
-                }
-                filtered_input = filtered;
-                &filtered_input
-            }
-            _ => input_item,
-        };
-        let hook_outcome = inspect_pending_input(sess, turn_context, input_item).await;
+    for input_item in recordable_inputs(sess, input) {
+        let input_item = input_item?;
+        let hook_outcome = inspect_pending_input(sess, turn_context, &input_item).await;
         if hook_outcome.should_stop {
             blocked_input = true;
             record_additional_contexts(sess, turn_context, hook_outcome.additional_contexts).await;
         } else {
-            if let TurnInput::UserInput { content, .. } = input_item {
-                // Prompt telemetry can contain the full text, so emit it only after hooks accept it.
-                turn_context.session_telemetry.user_prompt(content);
-            }
-            if matches!(input_item, TurnInput::UserInput { content, .. } if !content.is_empty()) {
+            if matches!(input_item.as_ref(), TurnInput::UserInput { content, .. } if !content.is_empty())
+            {
                 accepted_user_input = true;
             }
             // Tool outputs retain their durability barrier, including in mixed input batches.
             let input_persist_context = if persist_context == PersistContext::SteeredUserInput
-                && matches!(input_item, TurnInput::FunctionCallOutput(_))
+                && matches!(input_item.as_ref(), TurnInput::FunctionCallOutput(_))
             {
                 PersistContext::Standard
             } else {
@@ -1027,17 +995,48 @@ pub(crate) async fn run_hooks_and_record_inputs(
                 sess,
                 turn_context,
                 model_info,
-                input_item.clone(),
+                input_item.into_owned(),
                 hook_outcome.additional_contexts,
                 input_persist_context,
             )
             .await;
         }
     }
-    if rejected_uploaded_audio {
-        return Err(uploaded_audio_disabled_error());
-    }
     Ok(blocked_input && !accepted_user_input)
+}
+
+/// Yields usable input in order, then reports unsupported audio after valid siblings can be recorded.
+pub(crate) fn recordable_inputs<'a>(
+    sess: &Session,
+    input: &'a [TurnInput],
+) -> impl Iterator<Item = CodexResult<Cow<'a, TurnInput>>> {
+    let rejected_audio = input.iter().any(turn_input_has_uploaded_audio_file);
+    // Only finalized evidence may enter reusable Guardian history.
+    let items: &[TurnInput] = if sess
+        .services
+        .thread_extension_data
+        .get::<crate::guardian::PendingReviewContext>()
+        .is_some()
+    {
+        &[]
+    } else {
+        input
+    };
+    items
+        .iter()
+        .filter_map(|item| {
+            let mut item = Cow::Borrowed(item);
+            if turn_input_has_uploaded_audio_file(&item)
+                && let TurnInput::UserInput { content, .. } = item.to_mut()
+            {
+                content.retain(|part| !is_uploaded_audio_file(part));
+                if content.is_empty() {
+                    return None;
+                }
+            }
+            Some(Ok(item))
+        })
+        .chain(rejected_audio.then(|| Err(uploaded_audio_disabled_error())))
 }
 
 fn turn_input_has_uploaded_audio_file(input: &TurnInput) -> bool {
@@ -1271,6 +1270,7 @@ async fn build_skills_and_plugins(
         mcp_tools,
         &available_connectors,
         &turn_context.config.features,
+        codex_prompts::ResolvedModelMessages::from_model(&step_context.settings.model_info),
     );
     let mut explicitly_enabled_connectors = collect_explicit_app_ids(user_input);
     explicitly_enabled_connectors.extend(skill_connector_ids);
@@ -1872,6 +1872,11 @@ async fn run_sampling_request(
         if first_attempt && turn_context.config.notify.is_some() {
             notify_messages = legacy_notify_input_messages(&prompt.input);
         }
+        let _native_search = crate::model_search::SearchOwner::reserve_server_fallback(
+            &step_context.extension_data,
+            &sess.services.thread_extension_data,
+            &mut prompt.tools,
+        );
         let mut draining_for_mailbox = false;
         let err = match try_run_sampling_request(
             tool_runtime.clone(),
@@ -1901,6 +1906,9 @@ async fn run_sampling_request(
                     if let Some(rate_limits) = rate_limits {
                         sess.update_rate_limits(&turn_context, *rate_limits).await;
                     }
+                    return Err(err);
+                }
+                CodexErrorDetails::SessionBudgetExceeded | CodexErrorDetails::Fatal(_) => {
                     return Err(err);
                 }
                 _ => err,
@@ -2557,6 +2565,7 @@ async fn emit_agent_message_in_plan_mode(
     sess: &Session,
     turn_context: &TurnContext,
     agent_message: codex_protocol::items::AgentMessageItem,
+    content_token_count: Option<u64>,
     state: &mut PlanModeStreamState,
 ) {
     let agent_message_id = agent_message.id.clone();
@@ -2592,8 +2601,12 @@ async fn emit_agent_message_in_plan_mode(
             .insert(agent_message_id.clone());
     }
 
-    sess.emit_turn_item_completed(turn_context, TurnItem::AgentMessage(agent_message))
-        .await;
+    sess.emit_turn_item_completed_with_token_count(
+        turn_context,
+        TurnItem::AgentMessage(agent_message),
+        content_token_count,
+    )
+    .await;
     state.started_agent_message_items.remove(&agent_message_id);
 }
 
@@ -2602,12 +2615,20 @@ async fn emit_turn_item_in_plan_mode(
     sess: &Session,
     turn_context: &TurnContext,
     turn_item: TurnItem,
+    content_token_count: Option<u64>,
     previously_active_item: Option<&TurnItem>,
     state: &mut PlanModeStreamState,
 ) {
     match turn_item {
         TurnItem::AgentMessage(agent_message) => {
-            emit_agent_message_in_plan_mode(sess, turn_context, agent_message, state).await;
+            emit_agent_message_in_plan_mode(
+                sess,
+                turn_context,
+                agent_message,
+                content_token_count,
+                state,
+            )
+            .await;
         }
         _ => {
             if previously_active_item.is_none() {
@@ -2648,6 +2669,7 @@ async fn handle_assistant_item_done_in_plan_mode(
                 sess,
                 turn_context,
                 finalized_turn_item.turn_item,
+                finalized_turn_item.content_token_count,
                 previously_active_item,
                 state,
             )
@@ -3148,7 +3170,10 @@ async fn try_run_sampling_request(
                         .config
                         .features
                         .enabled(Feature::DeferMailboxPreemption)
-                    && sess.input_queue.has_pending_mailbox_items().await
+                    && sess
+                        .input_queue
+                        .should_preempt_sampling_for_mail(&sess.active_turn, &turn_context.sub_id)
+                        .await
                 {
                     tracing::event!(
                         name: "codex.mailbox_preemption",

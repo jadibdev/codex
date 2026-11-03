@@ -209,12 +209,21 @@ impl SideParentStatusChange {
     }
 }
 
+/// Transcript state retained while the other conversation is active.
+pub(super) struct SideCompanion {
+    pub(super) display: crate::app_event::CapturedSideDisplay,
+    pub(super) cells: Vec<Arc<dyn HistoryCell>>,
+    pub(super) view: crate::transcript_view::TranscriptView,
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct SideThreadState {
     /// Thread to return to when the current side conversation is dismissed.
     pub(super) parent_thread_id: ThreadId,
     /// Parent-thread condition that changed while this side thread is visible.
     pub(super) parent_status: Option<SideParentStatus>,
+    /// A hidden pane keeps its child and parked display for the next focus switch.
+    pub(super) pane_open: bool,
 }
 
 impl SideThreadState {
@@ -222,6 +231,7 @@ impl SideThreadState {
         Self {
             parent_thread_id,
             parent_status: None,
+            pane_open: true,
         }
     }
 }
@@ -306,6 +316,29 @@ impl App {
         self.current_displayed_thread_id()
             .and_then(|thread_id| self.side_threads.get(&thread_id))
             .map(|state| state.parent_thread_id)
+    }
+
+    pub(super) fn side_retention_enabled(&self, tui: &tui::Tui) -> bool {
+        self.local_settings.workspace_enabled(&self.config) && tui.is_owned_screen()
+    }
+
+    pub(super) fn side_pane_shortcuts_available(&self, tui: &tui::Tui) -> bool {
+        self.side_retention_enabled(tui)
+            && !self.reconnect.offline
+            && self.overlay.is_none()
+            && self.chat_widget.no_modal_or_popup_active()
+            && self
+                .current_displayed_thread_id()
+                .and_then(|id| self.side_pair_key(id))
+                .is_some()
+    }
+
+    pub(super) fn side_pair_key(&self, thread_id: ThreadId) -> Option<ThreadId> {
+        if self.side_threads.contains_key(&thread_id) {
+            Some(thread_id)
+        } else {
+            self.side_thread_for_parent(thread_id)
+        }
     }
 
     pub(super) fn side_thread_for_parent(&self, parent_thread_id: ThreadId) -> Option<ThreadId> {
@@ -432,6 +465,30 @@ impl App {
         Ok(())
     }
 
+    pub(super) async fn hide_focused_side_pane(
+        &mut self,
+        tui: &mut tui::Tui,
+        app_server: &mut AppServerSession,
+    ) -> Result<()> {
+        let Some(child) = self.current_displayed_thread_id() else {
+            return Ok(());
+        };
+        let Some(side) = self.side_threads.get(&child) else {
+            return Ok(());
+        };
+        let parent = side.parent_thread_id;
+        self.select_agent_thread(tui, app_server, parent).await?;
+        if self.current_displayed_thread_id() == Some(parent)
+            && let Some(side) = self.side_threads.get_mut(&child)
+        {
+            side.pane_open = false;
+            tui.frame_requester().schedule_frame();
+            self.surface_pending_inactive_thread_interactive_requests()
+                .await?;
+        }
+        Ok(())
+    }
+
     pub(super) async fn discard_side_thread(
         &mut self,
         app_server: &mut AppServerSession,
@@ -543,6 +600,7 @@ impl App {
         self.pending_server_profiles.remove(&thread_id);
         self.agents_overview.activity.remove(&thread_id);
         self.side_threads.remove(&thread_id);
+        self.side_companions.remove(&thread_id);
         self.agent_navigation.remove(thread_id);
         if self.active_thread_id == Some(thread_id) {
             self.clear_active_thread().await;
@@ -785,6 +843,7 @@ impl App {
                     /*agent_role*/ None,
                     /*is_closed*/ false,
                 );
+                self.sync_agent_picker_thread(child_thread_id);
                 if let Err(err) = app_server
                     .thread_inject_items(child_thread_id, vec![Self::side_boundary_prompt_item()])
                     .await

@@ -25,6 +25,9 @@ doctest = false
 workspace = true
 
 [dependencies]
+codex-agent-message-board-client = { workspace = true }
+codex-agent-message-board-extension = { workspace = true }
+codex-message-board = { workspace = true }
 codex-utils-process = { workspace = true }
 anyhow = { workspace = true }
 base64 = { workspace = true }
@@ -55,6 +58,7 @@ codex-multi-env-copy-file = { workspace = true }
 codex-goal-extension = { workspace = true }
 codex-git-attribution = { workspace = true }
 codex-guardian-v2 = { workspace = true }
+codex-guardian-v3 = { workspace = true }
 codex-git-utils = { workspace = true }
 codex-file-watcher = { workspace = true }
 codex-hooks = { workspace = true }

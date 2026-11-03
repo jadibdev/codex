@@ -8,6 +8,7 @@ use super::rate_limit_refresh::RateLimitRefreshOutcome;
 use super::resize_reflow::trailing_run_start;
 use super::session_lifecycle::ThreadAttachPresentation;
 use super::*;
+use crate::app_event::CapturedSideStream;
 use crate::app_event::RecapTrigger;
 use crate::app_event::ThreadTitleDestination;
 use crate::app_server_session::ForkGoalContinuation;
@@ -87,6 +88,8 @@ impl App {
                     | AppEvent::RunDaemonUpdate(_)
                     | AppEvent::InsertHistoryCell(_)
                     | AppEvent::CommitRealtimeTranscriptHistory
+                    | AppEvent::ParkSideCompanion { .. }
+                    | AppEvent::SideReplayFinished(_)
                     | AppEvent::ResetTranscriptForThreadSwitch
                     | AppEvent::ResetTranscriptForThreadSwitchPreservingScreen
                     | AppEvent::FinishPromptRevert { .. }
@@ -209,7 +212,15 @@ impl App {
             }
             AppEvent::PluginMentionsLoaded { ref cwd, .. }
                 if cwds_differ(cwd, self.config.cwd.as_path()) => {}
-            AppEvent::NewSession { name } => {
+            AppEvent::ChooseNewSessionCheckout { name }
+                if self.chat_widget.managed_worktree_available() =>
+            {
+                self.chat_widget
+                    .open_session_checkout_picker(crate::app_event::ManagedWorktreeMode::New, name);
+            }
+            AppEvent::ChooseNewSessionCheckout { name }
+            | AppEvent::NewSession { name }
+            | AppEvent::NewSessionInCurrentWorktree { name } => {
                 self.start_fresh_session(
                     tui, app_server, /*session_start_source*/ None,
                     /*initial_user_message*/ None, name,
@@ -479,8 +490,7 @@ impl App {
                 self.chat_widget.maybe_send_next_queued_input();
             }
             AppEvent::SelectTranscriptCopy { guard } => {
-                let size = tui.prepare_draw_size()?;
-                self.render_owned_transcript(tui, size)?;
+                self.refresh_owned_transcript(tui)?;
                 if !self.transcript_view.begin_copy_mode(&self.transcript_cells, Some(guard)) {
                     self.chat_widget.add_info_message("Nothing to copy".into(), /*hint*/ None);
                 }
@@ -597,7 +607,7 @@ impl App {
                     Err(err) => return Err(err),
                 }
             }
-            AppEvent::ResumeBackendSession(_) => {
+            AppEvent::ResumeBackendSession(_) | AppEvent::CycleNewConversationBackend => {
                 unreachable!("backend selection is handled by the session manager")
             }
             AppEvent::ArchiveCurrentThread => {
@@ -931,9 +941,66 @@ impl App {
             AppEvent::BeginThreadSwitchHistoryReplayBuffer => {
                 self.begin_thread_switch_history_replay_buffer();
             }
+            AppEvent::ParkSideCompanion { pair, thread_id, stream, display } => {
+                if self.side_threads.contains_key(&pair) {
+                    self.transcript_view.sync_history_tail(&self.transcript_cells);
+                    if let Some(stream) = stream {
+                        let cells = &mut self.transcript_cells;
+                        let (start, replacement): (_, Arc<dyn HistoryCell>) = match stream {
+                            CapturedSideStream::Answer(cell) => {
+                                (trailing_run_start::<history_cell::AgentMessageCell>(cells), cell)
+                            }
+                            CapturedSideStream::Plan(cell) => {
+                                (trailing_run_start::<history_cell::ProposedPlanStreamCell>(cells), cell)
+                            }
+                        };
+                        let range = start..cells.len();
+                        self.transcript_view.replace_group(cells, range.clone(), &replacement);
+                        cells.splice(range, [replacement]);
+                    }
+                    self.side_companions.insert(thread_id, SideCompanion {
+                        display,
+                        cells: std::mem::take(&mut self.transcript_cells),
+                        view: std::mem::take(&mut self.transcript_view),
+                    });
+                }
+            }
             AppEvent::ResetTranscriptForThreadSwitch => {
                 self.reset_for_thread_switch(tui)?;
                 self.pending_thread_switch_resets -= 1;
+            }
+            AppEvent::SideReplayFinished(id) => {
+                self.pending_thread_switch_resets -= 1;
+                let finished_current_replay = self.pending_thread_switch_resets == 0
+                    && self.current_displayed_thread_id() == Some(id);
+                // Keys typed against the old frame must not answer the newly revealed modal.
+                self.startup_protected_input_boundary |=
+                    finished_current_replay && self.chat_widget.has_active_modal();
+                if finished_current_replay && let Some(companion) = self.side_companions.remove(&id)
+                {
+                    let replay_may_have_output = match self.thread_event_channels.get(&id) {
+                        Some(channel) => channel.store.lock().await.replay_may_have_output,
+                        None => true,
+                    };
+                    self.transcript_view = companion.view;
+                    self.transcript_view.restore_after_replay(
+                        &companion.cells,
+                        &self.transcript_cells,
+                        replay_may_have_output,
+                        self.chat_widget.active_cell_transcript_key(),
+                    );
+                    self.scrollback_has_older_history = app_server.has_older_history(id);
+                    if self.transcript_view.history == TranscriptHistoryState::LoadingOlder
+                        && app_server.pending_older_history_cursor(id).is_none()
+                    {
+                        self.transcript_view.history = if self.scrollback_has_older_history {
+                            TranscriptHistoryState::Partial
+                        } else {
+                            TranscriptHistoryState::Complete
+                        };
+                    }
+                    tui.frame_requester().schedule_frame();
+                }
             }
             AppEvent::ResetTranscriptForThreadSwitchPreservingScreen => {
                 self.reset_transcript_state_after_clear();
@@ -1144,6 +1211,34 @@ impl App {
             }
             AppEvent::ImagesPrepared(id) => {
                 self.chat_widget.on_images_prepared(id);
+            }
+            AppEvent::CodexOp(AppCommand::ListSkills { cwds, force_reload: true })
+                if self.awaiting_side_replay(tui)
+                    && let Some(thread_id) = self.active_thread_id
+                    && self.side_pair_key(thread_id).is_some()
+                    && !self.thread_unavailable(thread_id) =>
+            {
+                // Session replay refreshes skill metadata. Let focus paint while that RPC is pending.
+                let cwd = self.chat_widget.config_ref().cwd.to_path_buf();
+                if cwds.contains(&cwd) {
+                    let request_id = Uuid::new_v4();
+                    app_server.pending_side_skills_refresh = Some(request_id);
+                    let rpc_id = app_server.next_request_id();
+                    let request_handle = app_server.request_handle();
+                    let app_event_tx = self.app_event_tx.clone();
+                    tokio::spawn(async move {
+                        let result = background_requests::fetch_skills_list(
+                            request_handle,
+                            rpc_id,
+                            SkillsListParams { cwds, force_reload: true },
+                        )
+                        .await
+                        .map_err(|err| format!("{err:#}"));
+                        app_event_tx.send(AppEvent::SideReplaySkillsLoaded {
+                            request_id, thread_id, cwd, result,
+                        });
+                    });
+                }
             }
             AppEvent::CodexOp(mut op) => {
                 if let AppCommand::OverrideTurnContext {
@@ -1803,6 +1898,20 @@ impl App {
                 thread_id,
             } => {
                 self.handle_mcp_inventory_result(result, detail, thread_id);
+            }
+            AppEvent::SideReplaySkillsLoaded { request_id, thread_id, cwd, result } => {
+                if app_server.pending_side_skills_refresh == Some(request_id) {
+                    app_server.pending_side_skills_refresh = None;
+                    if !self.awaiting_side_replay(tui)
+                        && self.current_displayed_thread_id() == Some(thread_id)
+                        && !cwds_differ(&cwd, self.chat_widget.config_ref().cwd.as_path())
+                    {
+                        self.handle_skills_list_result(
+                            result.map_err(|err| color_eyre::eyre::eyre!(err)),
+                            "failed to refresh skills",
+                        );
+                    }
+                }
             }
             AppEvent::SkillsListLoaded { result, .. } => {
                 self.handle_skills_list_result(
@@ -3120,36 +3229,12 @@ impl App {
                     return Ok(AppRunControl::Continue);
                 }
                 self.finish_thread_title_generation(thread_id, destination);
-                match destination {
-                    ThreadTitleDestination::Automatic => {
-                        if let Ok(response) = result
-                            && let Some(title) = super::thread_title::parse_thread_title(&response)
-                            && let Ok(thread) = app_server
-                                .thread_read(thread_id, /*include_turns*/ false)
-                                .await
-                            && thread.name.is_none()
-                        {
-                            match app_server.thread_set_name(thread_id, title.clone()).await {
-                                Ok(()) => self
-                                    .chat_widget
-                                    .on_thread_name_updated(thread_id, Some(title)),
-                                Err(error) => {
-                                    tracing::debug!(%error, "failed to apply generated thread title");
-                                }
-                            }
-                        }
-                    }
-                    ThreadTitleDestination::RenameSuggestion { request_id } => {
-                        let suggestion = result
-                            .ok()
-                            .and_then(|response| super::thread_title::parse_thread_title(&response));
-
-                        self.chat_widget.apply_thread_name_suggestion(
-                            thread_id,
-                            request_id,
-                            suggestion.as_deref(),
-                        );
-                    }
+                if let ThreadTitleDestination::RenameSuggestion { request_id } = destination {
+                    let suggestion = result.ok()
+                        .and_then(|response| super::thread_title::parse_thread_title(&response));
+                    self.chat_widget.apply_thread_name_suggestion(
+                        thread_id, request_id, suggestion.as_deref(),
+                    );
                 }
             }
             AppEvent::HideAgentsOverviewThread { thread_id } => {
@@ -3721,7 +3806,10 @@ impl App {
             }
         };
 
-        let runtime_keymap = match RuntimeKeymap::from_config(&keymap_config) {
+        let runtime_keymap = match RuntimeKeymap::for_session(
+            &keymap_config,
+            self.local_settings.workspace_enabled(&self.config),
+        ) {
             Ok(runtime_keymap) => runtime_keymap,
             Err(err) => {
                 let params = crate::keymap_setup::build_keymap_conflict_params(
@@ -3814,7 +3902,10 @@ impl App {
             }
         };
 
-        let runtime_keymap = match RuntimeKeymap::from_config(&keymap_config) {
+        let runtime_keymap = match RuntimeKeymap::for_session(
+            &keymap_config,
+            self.local_settings.workspace_enabled(&self.config),
+        ) {
             Ok(runtime_keymap) => runtime_keymap,
             Err(err) => {
                 self.app_event_tx.send(AppEvent::FollowTranscript);

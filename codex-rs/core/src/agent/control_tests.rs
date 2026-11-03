@@ -2435,6 +2435,7 @@ async fn spawn_agent_fork_from_paginated_parent_uses_model_context_prefix(
                 internal_chat_message_metadata_passthrough: None,
             }),
             RolloutItem::EventMsg(EventMsg::ItemCompleted(ItemCompletedEvent {
+                content_token_count: None,
                 thread_id: parent_thread_id,
                 turn_id: "parent-turn".to_string(),
                 item: TurnItem::UserMessage(UserMessageItem {
@@ -3793,10 +3794,8 @@ async fn spawn_agent_full_fork_legacy_compaction_rebuilds_child_instructions_onc
             Arc::new(crate::test_support::EmptyUserInstructionsProvider),
             /*analytics_events_client*/ None,
             crate::thread_manager::passthrough_image_store(),
-            crate::thread_manager::thread_store_from_config(
-                &parent_config,
-                harness.state_db.clone(),
-            ),
+            crate::ThreadStoreBuilder::from_config(&parent_config, harness.state_db.clone())
+                .build(),
             crate::thread_manager::local_agent_graph_store_from_state_db(harness.state_db.as_ref()),
             uuid::Uuid::new_v4().to_string(),
             /*attestation_provider*/ None,

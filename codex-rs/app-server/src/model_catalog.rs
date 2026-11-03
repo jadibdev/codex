@@ -65,6 +65,13 @@ impl ModelCatalog {
         self.state.lock().await.needs_reload = true;
     }
 
+    pub(crate) async fn invalidate_if_current_provider(&self, provider_id: &str) {
+        let mut state = self.state.lock().await;
+        if state.config.model_provider_id == provider_id {
+            state.needs_reload = true;
+        }
+    }
+
     pub(crate) async fn set_api_key_model_discovery_enabled(&self, enabled: bool) {
         self.state
             .lock()
@@ -112,8 +119,21 @@ impl ModelCatalog {
         refresh_strategy: RefreshStrategy,
     ) -> std::io::Result<Vec<ModelPreset>> {
         let (config, models_manager) = self.current().await?;
-        self.list_models_from_snapshot(config, models_manager, refresh_strategy)
-            .await
+        let models = self
+            .list_models_from_snapshot(
+                Arc::clone(&config),
+                Arc::clone(&models_manager),
+                refresh_strategy,
+            )
+            .await?;
+        // The periodic worker also refreshes retained Work catalogs. Picker RPCs use
+        // list_models_from_snapshot directly and do not wait on other originators.
+        if refresh_strategy == RefreshStrategy::Online {
+            models_manager
+                .refresh_originator_catalogs(config.http_client_factory())
+                .await;
+        }
+        Ok(models)
     }
 
     pub(crate) async fn list_models_from_snapshot(
