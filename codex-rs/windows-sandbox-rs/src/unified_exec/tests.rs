@@ -369,7 +369,11 @@ fn elevated_approved_missing_file_outside_writable_roots_is_writable() {
         let target = outside.path().join("brief.txt");
         let sibling = outside.path().join("sibling.txt");
         // The command line below passes paths unquoted.
-        assert!(!target.to_string_lossy().contains(' '), "{}", target.display());
+        assert!(
+            !target.to_string_lossy().contains(' '),
+            "{}",
+            target.display()
+        );
         let target_abs = AbsolutePathBuf::from_absolute_path(&target).expect("absolute target");
         let permission_profile = PermissionProfile::workspace_write_with(
             &[target_abs],
