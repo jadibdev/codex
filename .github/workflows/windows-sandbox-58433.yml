@@ -8,6 +8,8 @@ on:
   push:
     branches:
       - "ci/windows-sandbox-58433"
+      # Gate 5 revert-proof: same tests with materialization disabled.
+      - "ci/windows-sandbox-58433-revert"
       - "ci/windows-sandbox-baseline"
   workflow_dispatch:
 
@@ -43,6 +45,22 @@ jobs:
         with:
           components: clippy, rustfmt
 
+      # The rusty_v8 fork's Chromium submodules take ~9 min to clone and the
+      # crate ~8 min to build; reuse both across runs.
+      # Restore and save are split because the job always fails on the 9
+      # baseline runner failures, and actions/cache only saves on success.
+      - name: Restore cargo downloads and build output
+        uses: actions/cache/restore@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            ${{ env.CARGO_TARGET_DIR }}
+          key: windows-sandbox-58433-${{ hashFiles('codex-rs/Cargo.lock', 'codex-rs/rust-toolchain.toml') }}-${{ github.sha }}
+          restore-keys: |
+            windows-sandbox-58433-${{ hashFiles('codex-rs/Cargo.lock', 'codex-rs/rust-toolchain.toml') }}-
+
       - name: Record environment
         run: |
           set -euo pipefail
@@ -66,6 +84,14 @@ jobs:
         run: |
           set -euo pipefail
           cargo fmt -p codex-windows-sandbox -- --check 2>&1 | tee "${RUNNER_TEMP}/logs/02-fmt.log"
+
+      # Lets a contributor without a local toolchain apply formatting with `git apply`.
+      - name: Export rustfmt patch
+        if: always()
+        run: |
+          cargo fmt -p codex-windows-sandbox || true
+          git diff -- windows-sandbox-rs > "${RUNNER_TEMP}/logs/rustfmt.patch"
+          git checkout -- windows-sandbox-rs
 
       - name: Build sandbox helper binaries
         run: |
@@ -93,6 +119,10 @@ jobs:
           helper_dir="${CARGO_TARGET_DIR}/debug"
           export CARGO_BIN_EXE_codex_windows_sandbox_setup="$(cygpath -w "${helper_dir}/codex-windows-sandbox-setup.exe")"
           export CARGO_BIN_EXE_codex_command_runner="$(cygpath -w "${helper_dir}/codex-command-runner.exe")"
+          # The elevated backend looks for the helpers next to current_exe(),
+          # which for cargo test binaries is target/debug/deps.
+          mkdir -p "${helper_dir}/deps"
+          cp "${helper_dir}/codex-windows-sandbox-setup.exe" "${helper_dir}/codex-command-runner.exe" "${helper_dir}/deps/"
           cargo test -p codex-windows-sandbox --no-fail-fast -- --nocapture 2>&1 \
             | tee "${RUNNER_TEMP}/logs/05-test.log"
 
@@ -106,6 +136,17 @@ jobs:
             grep -E "^test result:|^test .*(placeholder|candidates|missing_write|58433|58118|write_pattern|is_allowed_write_target)" "${log}" || echo "no test log"
             echo '```'
           } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Save cargo downloads and build output
+        if: always()
+        uses: actions/cache/save@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            ${{ env.CARGO_TARGET_DIR }}
+          key: windows-sandbox-58433-${{ hashFiles('codex-rs/Cargo.lock', 'codex-rs/rust-toolchain.toml') }}-${{ github.sha }}
 
       - name: Upload logs
         if: always()
