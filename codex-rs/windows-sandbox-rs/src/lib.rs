@@ -206,6 +206,10 @@ mod unified_exec;
 #[cfg(target_os = "windows")]
 mod wrapper;
 
+#[cfg(all(test, target_os = "windows"))]
+#[path = "missing_write_grant_tests.rs"]
+mod missing_write_grant_tests;
+
 #[cfg(target_os = "windows")]
 pub(crate) use elevated::ipc_framed;
 
@@ -725,20 +729,21 @@ mod windows_impl {
             .iter()
             .map(AbsolutePathBuf::to_path_buf)
             .collect::<Vec<_>>();
-        let common = prepare_legacy_spawn_context(
+        let mut common = prepare_legacy_spawn_context(
             permission_profile,
             workspace_roots,
             codex_home,
             cwd,
             &mut env_map,
             &command,
+            &additional_deny_write_paths,
             SpawnPrepOptions {
                 inherit_path: false,
                 add_git_safe_directory: false,
             },
         )?;
-        let permissions = common.permissions;
-        let current_dir = common.current_dir;
+        let permissions = common.permissions.clone();
+        let current_dir = common.current_dir.clone();
         let logs_base_dir = common.logs_base_dir.as_deref();
         let uses_write_capabilities = common.uses_write_capabilities;
         if !permissions.has_full_disk_read_access() {
@@ -810,6 +815,7 @@ mod windows_impl {
                 return Err(err);
             }
         };
+        common.placeholder_guard.commit();
         let pi = created.process_info;
         let job = Arc::clone(&created.job);
         let _desktop = created;

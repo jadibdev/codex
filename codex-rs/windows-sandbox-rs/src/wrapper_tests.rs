@@ -193,3 +193,53 @@ fn windows_wrapper_args_round_trip() {
     missing_desktop_args.drain(name_index..name_index + 2);
     assert!(parse_windows_sandbox_wrapper_args(missing_desktop_args).is_err());
 }
+
+#[test]
+fn wrapper_materializes_and_commits_missing_write_placeholder() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    // The target must sit outside every writable root: inside one, the child
+    // can create it itself and no placeholder is made.
+    let work = temp.path().join("work");
+    std::fs::create_dir_all(&work).expect("create work dir");
+    let command_cwd = AbsolutePathBuf::from_absolute_path(&work).expect("absolute command cwd");
+    let missing_target = temp.path().join("missing_leaf.txt");
+    let missing_target_abs =
+        AbsolutePathBuf::from_absolute_path(&missing_target).expect("absolute target");
+    assert!(!missing_target.exists());
+
+    let mut env = HashMap::from([("Path".to_string(), r"C:\Windows\System32".to_string())]);
+    let permission_profile = PermissionProfile::workspace_write_with(
+        &[missing_target_abs],
+        codex_protocol::permissions::NetworkSandboxPolicy::Restricted,
+        // tempdir() lives under TEMP; keep TEMP out of the writable roots.
+        /*exclude_tmpdir_env_var*/
+        true,
+        /*exclude_slash_tmp*/ true,
+    );
+
+    let args = create_windows_sandbox_command_args_for_permission_profile(
+        vec![
+            "codex.exe".to_string(),
+            "--codex-run-as-fs-helper".to_string(),
+        ],
+        &command_cwd,
+        std::slice::from_ref(&command_cwd),
+        &mut env,
+        &permission_profile,
+        WindowsSandboxLevel::RestrictedToken,
+        /*proxy_enforced*/ true,
+        /*network_proxy_restricting_sid*/ Some("S-1-5-21-100-200-300-400"),
+        crate::WindowsSandboxProxySettingsMode::Preserve,
+        /*read_roots_override*/ None,
+        /*read_roots_include_platform_defaults*/ true,
+        /*write_roots_override*/ None,
+        /*deny_read_paths_override*/ &[],
+        /*deny_write_paths_override*/ &[],
+        temp.path(),
+    )
+    .expect("build wrapper args");
+
+    assert!(!args.is_empty());
+    assert!(missing_target.exists());
+    assert_eq!(std::fs::metadata(&missing_target).unwrap().len(), 0);
+}

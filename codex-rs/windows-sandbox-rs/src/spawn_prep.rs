@@ -17,6 +17,11 @@ use crate::env::normalize_null_device_env;
 use crate::identity::SandboxCreds;
 use crate::identity::require_logon_sandbox_creds;
 use crate::logging::log_start;
+use crate::no_reparse_dir::DirectoryOpenDisposition;
+use crate::no_reparse_dir::open_directory_no_reparse;
+use crate::no_reparse_dir::open_no_reparse;
+use crate::no_reparse_dir::validate_local_directory_path;
+use crate::path_normalization::canonical_path_key;
 use crate::path_normalization::canonicalize_path;
 use crate::resolved_permissions::ResolvedWindowsSandboxPermissions;
 use crate::sandbox_utils::ensure_codex_home_exists;
@@ -36,16 +41,168 @@ use codex_protocol::models::PermissionProfile;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use std::collections::HashMap;
 use std::ffi::c_void;
+use std::os::windows::ffi::OsStrExt;
+use std::os::windows::io::AsRawHandle;
+use std::os::windows::io::FromRawHandle;
+use std::os::windows::io::OwnedHandle;
 use std::path::Path;
 use std::path::PathBuf;
 use windows_sys::Win32::Foundation::CloseHandle;
 use windows_sys::Win32::Foundation::HANDLE;
+use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+use windows_sys::Win32::Storage::FileSystem::DELETE;
+use windows_sys::Win32::Storage::FileSystem::FILE_DISPOSITION_INFO;
+use windows_sys::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES;
+use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_DELETE;
+use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_WRITE;
+use windows_sys::Win32::Storage::FileSystem::FILE_STANDARD_INFO;
+use windows_sys::Win32::Storage::FileSystem::FILE_TRAVERSE;
+use windows_sys::Win32::Storage::FileSystem::FileDispositionInfo;
+use windows_sys::Win32::Storage::FileSystem::FileStandardInfo;
+use windows_sys::Win32::Storage::FileSystem::GetFileInformationByHandleEx;
+use windows_sys::Win32::Storage::FileSystem::ReOpenFile;
+use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
+use windows_sys::Win32::Storage::FileSystem::SetFileInformationByHandle;
+
+const FILE_CREATE: u32 = 2;
+const FILE_NON_DIRECTORY_FILE: u32 = 0x40;
+const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x20;
+
+/// Placeholders created for this spawn, deleted on drop unless committed.
+///
+/// Each handle holds only `FILE_READ_ATTRIBUTES | SYNCHRONIZE`, which do not
+/// participate in sharing checks, so the sandboxed child can open the file with
+/// any share mode while the guard is alive. Rollback reopens the same file
+/// object with `DELETE` instead of looking the path up again.
+pub(crate) struct PlaceholderRollbackGuard {
+    entries: Vec<(PathBuf, OwnedHandle)>,
+    logs_base_dir: Option<PathBuf>,
+    committed: bool,
+}
+
+impl PlaceholderRollbackGuard {
+    pub(crate) fn new(logs_base_dir: Option<&Path>) -> Self {
+        Self {
+            entries: Vec::new(),
+            logs_base_dir: logs_base_dir.map(Path::to_path_buf),
+            committed: false,
+        }
+    }
+
+    pub(crate) fn push(&mut self, path: PathBuf, handle: OwnedHandle) {
+        self.entries.push((path, handle));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub(crate) fn commit(&mut self) {
+        self.committed = true;
+        self.entries.clear();
+    }
+}
+
+impl Drop for PlaceholderRollbackGuard {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        for (path, handle) in self.entries.iter().rev() {
+            let note = match delete_placeholder_if_empty(handle) {
+                Ok(()) => format!("placeholder rolled back: {}", path.display()),
+                Err(reason) => format!(
+                    "placeholder rollback skipped for {}: {reason}",
+                    path.display()
+                ),
+            };
+            crate::logging::log_note(&note, self.logs_base_dir.as_deref());
+        }
+    }
+}
+
+/// Creates a 0-byte placeholder named `file_name` inside `parent_handle`,
+/// failing if anything already exists there.
+pub(crate) fn create_placeholder_file(
+    parent_handle: &OwnedHandle,
+    file_name: &std::ffi::OsStr,
+) -> Result<OwnedHandle> {
+    let mut leaf_utf16: Vec<u16> = file_name.encode_wide().chain(Some(0)).collect();
+    open_no_reparse(
+        parent_handle.as_raw_handle() as HANDLE,
+        &mut leaf_utf16,
+        FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        FILE_CREATE,
+        FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
+    )
+}
+
+fn delete_placeholder_if_empty(handle: &OwnedHandle) -> std::result::Result<(), String> {
+    // Fails with a sharing violation while another opener holds the file
+    // without FILE_SHARE_DELETE; keeping the file is the safe outcome then.
+    let raw = unsafe {
+        ReOpenFile(
+            handle.as_raw_handle() as HANDLE,
+            DELETE | FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            0,
+        )
+    };
+    if raw == INVALID_HANDLE_VALUE {
+        return Err(format!(
+            "reopen for delete failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let delete_handle = unsafe { OwnedHandle::from_raw_handle(raw as _) };
+
+    let mut file_info = std::mem::MaybeUninit::<FILE_STANDARD_INFO>::uninit();
+    let ok = unsafe {
+        GetFileInformationByHandleEx(
+            delete_handle.as_raw_handle() as HANDLE,
+            FileStandardInfo,
+            file_info.as_mut_ptr().cast(),
+            std::mem::size_of::<FILE_STANDARD_INFO>() as u32,
+        )
+    };
+    if ok == 0 {
+        return Err(format!(
+            "size query failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let file_info = unsafe { file_info.assume_init() };
+    if file_info.EndOfFile != 0 {
+        return Err(format!("file non-empty (size={})", file_info.EndOfFile));
+    }
+
+    let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+    let ok = unsafe {
+        SetFileInformationByHandle(
+            delete_handle.as_raw_handle() as HANDLE,
+            FileDispositionInfo,
+            (&raw const disposition).cast(),
+            std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+        )
+    };
+    if ok == 0 {
+        return Err(format!(
+            "delete failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
 
 pub(crate) struct SpawnContext {
     pub(crate) permissions: ResolvedWindowsSandboxPermissions,
     pub(crate) current_dir: PathBuf,
     pub(crate) logs_base_dir: Option<PathBuf>,
     pub(crate) uses_write_capabilities: bool,
+    pub(crate) placeholder_guard: PlaceholderRollbackGuard,
 }
 
 pub(crate) struct ElevatedSpawnContext {
@@ -53,6 +210,7 @@ pub(crate) struct ElevatedSpawnContext {
     pub(crate) logs_base_dir: Option<PathBuf>,
     pub(crate) sandbox_creds: SandboxCreds,
     pub(crate) cap_sids: Vec<String>,
+    pub(crate) placeholder_guard: PlaceholderRollbackGuard,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -80,6 +238,117 @@ pub(crate) struct LegacyAclSids<'a> {
     pub(crate) write_root_sids: &'a [RootCapabilitySid],
 }
 
+/// Creates 0-byte placeholders for explicit write grants that do not exist yet,
+/// so the exact-file ACE can attach without granting anything on the parent.
+///
+/// `writable_roots` must return the roots this launch actually grants ACLs on;
+/// it is only called when there is a candidate. A candidate whose parent is
+/// already one of those roots (and not denied) is left for the child to create,
+/// as a file or a directory.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn materialize_missing_write_target_placeholders(
+    permissions: &ResolvedWindowsSandboxPermissions,
+    cwd: &Path,
+    env_map: &HashMap<String, String>,
+    codex_home: &Path,
+    additional_deny_write_paths: &[PathBuf],
+    logs_base_dir: Option<&Path>,
+    writable_roots: impl FnOnce() -> Vec<PathBuf>,
+) -> PlaceholderRollbackGuard {
+    let mut guard = PlaceholderRollbackGuard::new(logs_base_dir);
+    let candidates = permissions.explicit_missing_write_target_candidates(cwd);
+    if candidates.is_empty() {
+        return guard;
+    }
+    let writable_dirs: Vec<PathBuf> = writable_roots()
+        .into_iter()
+        .filter(|root| root.is_dir())
+        .collect();
+    let mut deny_paths: Vec<PathBuf> =
+        compute_allow_paths_for_permissions(permissions, cwd, env_map)
+            .deny
+            .into_iter()
+            .collect();
+    deny_paths.extend(additional_deny_write_paths.iter().cloned());
+
+    for candidate in candidates {
+        if candidate.symlink_metadata().is_ok() {
+            continue;
+        }
+        let candidate_key = canonical_path_key(&candidate);
+        if additional_deny_write_paths
+            .iter()
+            .any(|deny| canonical_path_key(deny) == candidate_key)
+        {
+            continue;
+        }
+        if !crate::setup::is_allowed_write_target_path(&candidate, codex_home) {
+            continue;
+        }
+        if validate_local_directory_path(&candidate).is_err() {
+            continue;
+        }
+        let Some(parent) = candidate.parent() else {
+            continue;
+        };
+        let Some(file_name) = candidate.file_name() else {
+            continue;
+        };
+        if parent.symlink_metadata().is_err() {
+            continue;
+        }
+        // Inside a denied directory the grant must not become writable; inside a
+        // writable root the child can create it itself. Either way, no placeholder.
+        if deny_paths
+            .iter()
+            .any(|deny| workspace_write_root_contains_path(deny, parent))
+        {
+            continue;
+        }
+        if writable_dirs
+            .iter()
+            .any(|root| workspace_write_root_contains_path(root, parent))
+        {
+            continue;
+        }
+        let parent_handle = match open_directory_no_reparse(
+            parent,
+            FILE_TRAVERSE | FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            DirectoryOpenDisposition::OpenExisting,
+        ) {
+            Ok(handle) => handle,
+            Err(err) => {
+                crate::logging::log_note(
+                    &format!(
+                        "placeholder parent open failed for {}: {err}",
+                        candidate.display()
+                    ),
+                    logs_base_dir,
+                );
+                continue;
+            }
+        };
+
+        match create_placeholder_file(&parent_handle, file_name) {
+            Ok(handle) => {
+                guard.push(candidate, handle);
+            }
+            Err(err) => {
+                crate::logging::log_note(
+                    &format!(
+                        "placeholder creation skipped for {}: {err}",
+                        candidate.display()
+                    ),
+                    logs_base_dir,
+                );
+            }
+        }
+    }
+    guard
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn prepare_spawn_context_common(
     permission_profile: &PermissionProfile,
     workspace_roots: &[AbsolutePathBuf],
@@ -87,6 +356,7 @@ pub(crate) fn prepare_spawn_context_common(
     cwd: &Path,
     env_map: &mut HashMap<String, String>,
     command: &[String],
+    additional_deny_write_paths: &[PathBuf],
     options: SpawnPrepOptions,
 ) -> Result<SpawnContext> {
     let permissions =
@@ -110,6 +380,17 @@ pub(crate) fn prepare_spawn_context_common(
     let logs_base_dir = Some(sandbox_base);
     log_start(command, logs_base_dir.as_deref());
 
+    let env_map: &HashMap<String, String> = env_map;
+    let placeholder_guard = materialize_missing_write_target_placeholders(
+        &permissions,
+        cwd,
+        env_map,
+        codex_home,
+        additional_deny_write_paths,
+        logs_base_dir.as_deref(),
+        || legacy_session_capability_roots(&permissions, cwd, env_map, codex_home),
+    );
+
     let uses_write_capabilities = permissions.uses_write_capabilities_for_cwd(cwd, env_map);
 
     Ok(SpawnContext {
@@ -117,9 +398,11 @@ pub(crate) fn prepare_spawn_context_common(
         current_dir: cwd.to_path_buf(),
         logs_base_dir,
         uses_write_capabilities,
+        placeholder_guard,
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn prepare_legacy_spawn_context(
     permission_profile: &PermissionProfile,
     workspace_roots: &[AbsolutePathBuf],
@@ -127,6 +410,7 @@ pub(crate) fn prepare_legacy_spawn_context(
     cwd: &Path,
     env_map: &mut HashMap<String, String>,
     command: &[String],
+    additional_deny_write_paths: &[PathBuf],
     options: SpawnPrepOptions,
 ) -> Result<SpawnContext> {
     let common = prepare_spawn_context_common(
@@ -136,6 +420,7 @@ pub(crate) fn prepare_legacy_spawn_context(
         cwd,
         env_map,
         command,
+        additional_deny_write_paths,
         options,
     )?;
     if common.permissions.should_apply_network_block() {
@@ -371,6 +656,33 @@ pub(crate) fn prepare_elevated_spawn_context_for_permissions(
     let logs_base_dir = Some(sandbox_base.clone());
     log_start(command, logs_base_dir.as_deref());
 
+    // Same roots this launch hands to setup below.
+    let placeholder_guard = materialize_missing_write_target_placeholders(
+        &permissions,
+        cwd,
+        env_map,
+        codex_home,
+        deny_write_paths_override,
+        logs_base_dir.as_deref(),
+        || {
+            if !permissions.uses_write_capabilities_for_cwd(cwd, env_map) {
+                return Vec::new();
+            }
+            let allow: Vec<PathBuf> =
+                compute_allow_paths_for_permissions(&permissions, cwd, env_map)
+                    .allow
+                    .into_iter()
+                    .collect();
+            effective_write_roots_for_permissions(
+                &permissions,
+                cwd,
+                env_map,
+                codex_home,
+                write_roots_override.or(Some(allow.as_slice())),
+            )
+        },
+    );
+
     let uses_write_capabilities = permissions.uses_write_capabilities_for_cwd(cwd, env_map);
 
     let AllowDenyPaths { allow, deny } =
@@ -442,26 +754,38 @@ pub(crate) fn prepare_elevated_spawn_context_for_permissions(
         logs_base_dir,
         sandbox_creds,
         cap_sids,
+        placeholder_guard,
     })
 }
 
 #[cfg(test)]
 mod tests {
+    use super::FILE_READ_ATTRIBUTES;
+    use super::FILE_SHARE_READ;
+    use super::FILE_SHARE_WRITE;
+    use super::FILE_TRAVERSE;
+    use super::PlaceholderRollbackGuard;
     use super::SpawnPrepOptions;
+    use super::create_placeholder_file;
     use super::deny_root_capabilities_for_path;
     use super::legacy_session_capability_roots;
+    use super::materialize_missing_write_target_placeholders;
     use super::prepare_legacy_spawn_context;
     use super::prepare_spawn_context_common;
     use super::root_capability_sids;
     use crate::cap::load_or_create_cap_sids;
     use crate::cap::workspace_write_cap_sid_for_root;
+    use crate::no_reparse_dir::DirectoryOpenDisposition;
+    use crate::no_reparse_dir::open_directory_no_reparse;
     use crate::resolved_permissions::ResolvedWindowsSandboxPermissions;
     use codex_protocol::models::PermissionProfile;
     use codex_protocol::permissions::NetworkSandboxPolicy;
     use codex_utils_absolute_path::AbsolutePathBuf;
     use pretty_assertions::assert_eq;
     use std::collections::HashMap;
+    use std::os::windows::fs::OpenOptionsExt;
     use std::path::Path;
+    use std::path::PathBuf;
     use tempfile::TempDir;
 
     fn workspace_profile(
@@ -522,6 +846,7 @@ mod tests {
             cwd.path(),
             &mut env_map,
             &["cmd.exe".to_string()],
+            &[],
             SpawnPrepOptions {
                 inherit_path: true,
                 add_git_safe_directory: false,
@@ -553,6 +878,7 @@ mod tests {
             cwd.path(),
             &mut env_map,
             &["cmd.exe".to_string()],
+            &[],
             SpawnPrepOptions {
                 inherit_path: true,
                 add_git_safe_directory: true,
@@ -715,5 +1041,426 @@ mod tests {
         assert!(roots.contains(&dunce::canonicalize(&active_root).expect("active root")));
         assert!(!roots.contains(&dunce::canonicalize(&codex_home).expect("codex home")));
         assert!(!roots.contains(&dunce::canonicalize(&sandbox_root).expect("sandbox root")));
+    }
+
+    /// Creates `name` in `dir` the way materialization does and arms a guard for it.
+    fn guarded_placeholder(dir: &Path, name: &str) -> (PathBuf, PlaceholderRollbackGuard) {
+        let parent_handle = open_directory_no_reparse(
+            dir,
+            FILE_TRAVERSE | FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            DirectoryOpenDisposition::OpenExisting,
+        )
+        .expect("open parent");
+        let handle = create_placeholder_file(&parent_handle, std::ffi::OsStr::new(name))
+            .expect("create placeholder");
+        let path = dir.join(name);
+        let mut guard = PlaceholderRollbackGuard::new(None);
+        guard.push(path.clone(), handle);
+        (path, guard)
+    }
+
+    fn open_without_share_delete(path: &Path) -> std::fs::File {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(path)
+            .expect("open without FILE_SHARE_DELETE")
+    }
+
+    #[test]
+    fn placeholder_guard_rollback_deletes_zero_byte_file_on_drop() {
+        let tmp = TempDir::new().expect("tempdir");
+        let (path, guard) = guarded_placeholder(tmp.path(), "placeholder.txt");
+        assert_eq!(std::fs::metadata(&path).expect("placeholder").len(), 0);
+
+        drop(guard);
+
+        assert!(
+            !path.exists(),
+            "uncommitted 0-byte placeholder must be deleted"
+        );
+    }
+
+    #[test]
+    fn placeholder_guard_rollback_preserves_non_empty_file_on_drop() {
+        let tmp = TempDir::new().expect("tempdir");
+        let (path, guard) = guarded_placeholder(tmp.path(), "placeholder_with_data.txt");
+        std::fs::write(&path, "important user data").expect("write user data");
+
+        drop(guard);
+
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("file kept"),
+            "important user data"
+        );
+    }
+
+    #[test]
+    fn placeholder_guard_commit_preserves_file_and_closes_handles() {
+        let tmp = TempDir::new().expect("tempdir");
+        let (path, mut guard) = guarded_placeholder(tmp.path(), "committed.txt");
+
+        guard.commit();
+        assert!(guard.is_empty(), "commit must close handles");
+        drop(guard);
+
+        assert!(path.exists(), "committed placeholder must stay on disk");
+    }
+
+    #[test]
+    fn placeholder_guard_does_not_block_openers_without_share_delete() {
+        // Many writers (MSVC CRT fopen, Office) omit FILE_SHARE_DELETE. The
+        // guard's handle must not make them fail with a sharing violation.
+        let tmp = TempDir::new().expect("tempdir");
+        let (path, guard) = guarded_placeholder(tmp.path(), "shared.txt");
+
+        let file = open_without_share_delete(&path);
+        drop(file);
+        drop(guard);
+
+        assert!(!path.exists(), "still-empty placeholder is rolled back");
+    }
+
+    #[test]
+    fn placeholder_guard_keeps_file_another_process_holds_open() {
+        let tmp = TempDir::new().expect("tempdir");
+        let (path, guard) = guarded_placeholder(tmp.path(), "held.txt");
+
+        let file = open_without_share_delete(&path);
+        drop(guard);
+
+        assert!(path.exists(), "rollback must not delete a file in use");
+        drop(file);
+    }
+
+    #[test]
+    fn materialize_placeholders_skips_missing_parent() {
+        let tmp = TempDir::new().expect("tempdir");
+        let cwd = tmp.path().join("work");
+        let codex_home = tmp.path().join("codex-home");
+        std::fs::create_dir_all(&cwd).expect("create cwd");
+        std::fs::create_dir_all(&codex_home).expect("create codex home");
+
+        let non_existent_parent = tmp.path().join("missing_parent");
+        let target = non_existent_parent.join("file.txt");
+
+        let profile = PermissionProfile::Managed {
+            file_system: codex_protocol::models::ManagedFileSystemPermissions::Restricted {
+                entries: vec![
+                    codex_protocol::permissions::FileSystemSandboxEntry::new(
+                        codex_protocol::permissions::FileSystemPath::Special {
+                            value: codex_protocol::permissions::FileSystemSpecialPath::Root,
+                        },
+                        codex_protocol::permissions::FileSystemAccessMode::Read,
+                    ),
+                    codex_protocol::permissions::FileSystemSandboxEntry::new(
+                        codex_protocol::permissions::FileSystemPath::Path {
+                            path: AbsolutePathBuf::from_absolute_path(&target).unwrap().into(),
+                        },
+                        codex_protocol::permissions::FileSystemAccessMode::Write,
+                    ),
+                ],
+                glob_scan_max_depth: None,
+            },
+            network: codex_protocol::permissions::NetworkSandboxPolicy::Restricted,
+        };
+        let permissions =
+            ResolvedWindowsSandboxPermissions::try_from_permission_profile(&profile).unwrap();
+
+        let guard = materialize_missing_write_target_placeholders(
+            &permissions,
+            &cwd,
+            &HashMap::new(),
+            &codex_home,
+            &[],
+            None,
+            Vec::new,
+        );
+        assert!(
+            guard.is_empty(),
+            "missing parent directory must be skipped without creating parent"
+        );
+        assert!(
+            !non_existent_parent.exists(),
+            "parent directory must not be created"
+        );
+        assert!(!target.exists(), "target must not be created");
+    }
+
+    #[test]
+    fn materialize_placeholders_preserves_existing_file() {
+        let tmp = TempDir::new().expect("tempdir");
+        let cwd = tmp.path().join("work");
+        let codex_home = tmp.path().join("codex-home");
+        std::fs::create_dir_all(&cwd).expect("create cwd");
+        std::fs::create_dir_all(&codex_home).expect("create codex home");
+
+        let existing_file = tmp.path().join("existing.txt");
+        std::fs::write(&existing_file, "existing file content").expect("write existing");
+
+        let profile = PermissionProfile::Managed {
+            file_system: codex_protocol::models::ManagedFileSystemPermissions::Restricted {
+                entries: vec![
+                    codex_protocol::permissions::FileSystemSandboxEntry::new(
+                        codex_protocol::permissions::FileSystemPath::Special {
+                            value: codex_protocol::permissions::FileSystemSpecialPath::Root,
+                        },
+                        codex_protocol::permissions::FileSystemAccessMode::Read,
+                    ),
+                    codex_protocol::permissions::FileSystemSandboxEntry::new(
+                        codex_protocol::permissions::FileSystemPath::Path {
+                            path: AbsolutePathBuf::from_absolute_path(&existing_file)
+                                .unwrap()
+                                .into(),
+                        },
+                        codex_protocol::permissions::FileSystemAccessMode::Write,
+                    ),
+                ],
+                glob_scan_max_depth: None,
+            },
+            network: codex_protocol::permissions::NetworkSandboxPolicy::Restricted,
+        };
+        let permissions =
+            ResolvedWindowsSandboxPermissions::try_from_permission_profile(&profile).unwrap();
+
+        let guard = materialize_missing_write_target_placeholders(
+            &permissions,
+            &cwd,
+            &HashMap::new(),
+            &codex_home,
+            &[],
+            None,
+            Vec::new,
+        );
+        assert!(
+            guard.is_empty(),
+            "existing file must not be added to rollback guard"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&existing_file).unwrap(),
+            "existing file content"
+        );
+    }
+
+    fn absolute(path: &Path) -> AbsolutePathBuf {
+        AbsolutePathBuf::from_absolute_path(path).expect("absolute path")
+    }
+
+    /// Materializes with the same roots a legacy launch grants ACLs on.
+    fn materialize_with_legacy_roots(
+        profile: &PermissionProfile,
+        workspace: &Path,
+        env_map: &HashMap<String, String>,
+        codex_home: &Path,
+        additional_deny_write_paths: &[PathBuf],
+    ) -> PlaceholderRollbackGuard {
+        let permissions =
+            ResolvedWindowsSandboxPermissions::try_from_permission_profile_for_workspace_roots(
+                profile,
+                workspace_roots_for(workspace).as_slice(),
+            )
+            .expect("managed permission profile");
+        materialize_missing_write_target_placeholders(
+            &permissions,
+            workspace,
+            env_map,
+            codex_home,
+            additional_deny_write_paths,
+            None,
+            || legacy_session_capability_roots(&permissions, workspace, env_map, codex_home),
+        )
+    }
+
+    #[test]
+    fn materialize_placeholders_n6_effective_parent_matrix() {
+        let tmp = TempDir::new().expect("tempdir");
+        let workspace = tmp.path().join("workspace");
+        let codex_home = tmp.path().join("codex-home");
+        let temp_dir = tmp.path().join("temp");
+        let protected = workspace.join("protected");
+        let outside = tmp.path().join("outside");
+        for dir in [&workspace, &codex_home, &temp_dir, &protected, &outside] {
+            std::fs::create_dir_all(dir).expect("create dir");
+        }
+        let workspace_out = workspace.join("out");
+        let temp_out = temp_dir.join("out");
+        let denied_new = protected.join("new.txt");
+        let outside_new = outside.join("new.txt");
+
+        let profile = workspace_profile(
+            NetworkSandboxPolicy::Restricted,
+            &[
+                absolute(&workspace_out),
+                absolute(&temp_out),
+                absolute(&denied_new),
+                absolute(&outside_new),
+            ],
+            /*exclude_tmpdir_env_var*/ false,
+            /*exclude_slash_tmp*/ true,
+        );
+        let env_map = HashMap::from([
+            ("TEMP".to_string(), temp_dir.display().to_string()),
+            ("TMP".to_string(), temp_dir.display().to_string()),
+        ]);
+
+        let guard = materialize_with_legacy_roots(
+            &profile,
+            &workspace,
+            &env_map,
+            &codex_home,
+            std::slice::from_ref(&protected),
+        );
+
+        assert!(
+            !workspace_out.exists(),
+            "creatable under the writable workspace"
+        );
+        assert!(!temp_out.exists(), "creatable under TEMP from env_map");
+        assert!(!denied_new.exists(), "inside a denied directory");
+        assert!(
+            outside_new.is_file(),
+            "outside every writable root gets a placeholder"
+        );
+
+        drop(guard);
+        assert!(
+            !outside_new.exists(),
+            "uncommitted placeholder is rolled back"
+        );
+    }
+
+    #[test]
+    fn materialize_placeholders_targets_user_profile_children_when_cwd_is_user_profile() {
+        // Windows strips USERPROFILE itself from writable roots, so a missing
+        // file directly under it is not creatable by the child even when the
+        // policy marks cwd == USERPROFILE writable (openai/codex#58433 RF-1).
+        let Some(user_profile) = std::env::var_os("USERPROFILE").map(PathBuf::from) else {
+            return;
+        };
+        let codex_home = TempDir::new().expect("tempdir");
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let target = user_profile.join(format!(
+            "codex-58433-placeholder-{}-{nonce}.txt",
+            std::process::id()
+        ));
+        assert!(!target.exists());
+        let profile = workspace_profile(
+            NetworkSandboxPolicy::Restricted,
+            &[absolute(&target)],
+            /*exclude_tmpdir_env_var*/ true,
+            /*exclude_slash_tmp*/ true,
+        );
+
+        let guard = materialize_with_legacy_roots(
+            &profile,
+            &user_profile,
+            &HashMap::new(),
+            codex_home.path(),
+            &[],
+        );
+
+        assert!(
+            target.is_file(),
+            "placeholder must be created under USERPROFILE"
+        );
+        drop(guard);
+        assert!(!target.exists(), "rollback removes the test placeholder");
+    }
+
+    fn sandbox_log_text(logs_dir: &Path) -> String {
+        std::fs::read_dir(logs_dir)
+            .expect("read log dir")
+            .filter_map(|entry| std::fs::read_to_string(entry.ok()?.path()).ok())
+            .collect()
+    }
+
+    #[test]
+    fn rollback_skip_is_written_to_sandbox_log() {
+        let tmp = TempDir::new().expect("tempdir");
+        let logs = TempDir::new().expect("logs tempdir");
+        let parent_handle = open_directory_no_reparse(
+            tmp.path(),
+            FILE_TRAVERSE | FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            DirectoryOpenDisposition::OpenExisting,
+        )
+        .expect("open parent");
+        let path = tmp.path().join("kept.txt");
+        let handle = create_placeholder_file(&parent_handle, std::ffi::OsStr::new("kept.txt"))
+            .expect("create placeholder");
+        let mut guard = PlaceholderRollbackGuard::new(Some(logs.path()));
+        guard.push(path.clone(), handle);
+        std::fs::write(&path, "user data").expect("write user data");
+
+        drop(guard);
+
+        assert!(path.exists(), "non-empty file is kept");
+        let log = sandbox_log_text(logs.path());
+        assert!(
+            log.contains("placeholder rollback skipped") && log.contains("non-empty"),
+            "log: {log}"
+        );
+    }
+
+    #[test]
+    fn materialize_placeholders_rejects_parent_and_ancestor_junctions() {
+        let tmp = TempDir::new().expect("tempdir");
+        let logs = TempDir::new().expect("logs tempdir");
+        let cwd = tmp.path().join("work");
+        let codex_home = tmp.path().join("codex-home");
+        let real = tmp.path().join("real");
+        let link = tmp.path().join("link");
+        for dir in [&cwd, &codex_home, &real.join("sub")] {
+            std::fs::create_dir_all(dir).expect("create dir");
+        }
+        let status = std::process::Command::new("cmd.exe")
+            .args(["/d", "/c", "mklink", "/J"])
+            .arg(&link)
+            .arg(&real)
+            .output()
+            .expect("run mklink");
+        assert!(status.status.success(), "mklink /J failed: {status:?}");
+
+        let through_parent = link.join("escaped.txt");
+        let through_ancestor = link.join("sub").join("escaped.txt");
+        let profile = workspace_profile(
+            NetworkSandboxPolicy::Restricted,
+            &[absolute(&through_parent), absolute(&through_ancestor)],
+            /*exclude_tmpdir_env_var*/ true,
+            /*exclude_slash_tmp*/ true,
+        );
+        let permissions =
+            ResolvedWindowsSandboxPermissions::try_from_permission_profile_for_workspace_roots(
+                &profile,
+                workspace_roots_for(&cwd).as_slice(),
+            )
+            .expect("managed permission profile");
+
+        let guard = materialize_missing_write_target_placeholders(
+            &permissions,
+            &cwd,
+            &HashMap::new(),
+            &codex_home,
+            &[],
+            Some(logs.path()),
+            Vec::new,
+        );
+
+        assert!(
+            guard.is_empty(),
+            "nothing may be created through a junction"
+        );
+        assert!(!real.join("escaped.txt").exists());
+        assert!(!real.join("sub").join("escaped.txt").exists());
+        let log = sandbox_log_text(logs.path());
+        assert_eq!(
+            log.matches("placeholder parent open failed").count(),
+            2,
+            "log: {log}"
+        );
     }
 }

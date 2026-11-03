@@ -1,3 +1,5 @@
+use crate::path_normalization::canonical_path_key;
+use crate::path_normalization::path_key_strictly_contains;
 use anyhow::Result;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::permissions::FileSystemPath;
@@ -21,6 +23,7 @@ use std::path::PathBuf;
 pub struct ResolvedWindowsSandboxPermissions {
     file_system: FileSystemSandboxPolicy,
     network: NetworkSandboxPolicy,
+    pub(crate) workspace_roots: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,6 +79,8 @@ impl ResolvedWindowsSandboxPermissions {
         Ok(Self {
             file_system,
             network,
+            // Filled by `try_from_permission_profile_for_workspace_roots`, which every spawn path uses.
+            workspace_roots: Vec::new(),
         })
     }
 
@@ -89,6 +94,10 @@ impl ResolvedWindowsSandboxPermissions {
         permissions.file_system = permissions
             .file_system
             .materialize_project_roots_with_workspace_roots(workspace_roots);
+        permissions.workspace_roots = workspace_roots
+            .iter()
+            .map(|p| p.as_path().to_path_buf())
+            .collect();
         Ok(permissions)
     }
 
@@ -169,6 +178,83 @@ impl ResolvedWindowsSandboxPermissions {
                     .collect(),
             })
             .collect()
+    }
+
+    pub(crate) fn explicit_missing_write_target_candidates(&self, cwd: &Path) -> Vec<PathBuf> {
+        let deny_matcher = ReadDenyMatcher::try_new_for_local_paths(&self.file_system, cwd)
+            .ok()
+            .flatten();
+
+        let cwd_key = canonical_path_key(cwd);
+        let workspace_root_keys: Vec<String> = self
+            .workspace_roots
+            .iter()
+            .map(|root| canonical_path_key(root))
+            .collect();
+        let entry_keys: Vec<String> = self
+            .file_system
+            .entries
+            .iter()
+            .filter_map(|entry| match &entry.path {
+                FileSystemPath::Path { path } => {
+                    let path = path.to_path_buf();
+                    Some(canonical_path_key(&if path.is_relative() {
+                        cwd.join(path)
+                    } else {
+                        path
+                    }))
+                }
+                _ => None,
+            })
+            .collect();
+
+        let mut candidates = Vec::new();
+        let mut candidate_keys = Vec::new();
+        for entry in &self.file_system.entries {
+            if !entry.access.can_write() || entry.skips_missing_path() {
+                continue;
+            }
+            let FileSystemPath::Path { path } = &entry.path else {
+                continue;
+            };
+            let candidate = path.to_path_buf();
+            let candidate = if candidate.is_relative() {
+                cwd.join(candidate)
+            } else {
+                candidate
+            };
+            // Windows paths compare case-insensitively and by whole components.
+            let candidate_key = canonical_path_key(&candidate);
+            if candidate_key == cwd_key || workspace_root_keys.contains(&candidate_key) {
+                continue;
+            }
+            // Entries below the candidate mean it is a directory root: explicit child
+            // carveouts, or protected subpaths such as `.git` that already exist.
+            if entry_keys
+                .iter()
+                .any(|other| path_key_strictly_contains(&candidate_key, other))
+            {
+                continue;
+            }
+            // Enforce ReadDenyMatcher (e.g. **/*.env deny globs)
+            if let Some(ref matcher) = deny_matcher
+                && matcher.is_local_path_read_denied(&candidate)
+            {
+                continue;
+            }
+            // Enforce policy write permission
+            if !self
+                .file_system
+                .can_write_local_path_with_cwd(&candidate, cwd)
+            {
+                continue;
+            }
+            if !candidate_keys.contains(&candidate_key) {
+                candidate_keys.push(candidate_key);
+                candidates.push(candidate);
+            }
+        }
+        candidates
     }
 }
 
@@ -678,6 +764,209 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("full-disk filesystem writes, which cannot be enforced")
+        );
+    }
+
+    #[test]
+    fn candidates_extracts_missing_file_grant() {
+        let dir = TempDir::new().unwrap();
+        let cwd = dir.path().join("work");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let target = dir.path().join("brief.docx");
+        assert!(!target.exists());
+
+        let profile = permission_profile_with_entries(vec![
+            FileSystemSandboxEntry::new(
+                FileSystemPath::Special {
+                    value: FileSystemSpecialPath::Root,
+                },
+                FileSystemAccessMode::Read,
+            ),
+            FileSystemSandboxEntry::new(
+                FileSystemPath::Path {
+                    path: AbsolutePathBuf::from_absolute_path(&target).unwrap().into(),
+                },
+                FileSystemAccessMode::Write,
+            ),
+        ]);
+        let permissions =
+            ResolvedWindowsSandboxPermissions::try_from_permission_profile(&profile).unwrap();
+        let candidates = permissions.explicit_missing_write_target_candidates(&cwd);
+        assert_eq!(candidates, vec![target]);
+    }
+
+    #[test]
+    fn candidates_excludes_skips_missing_path() {
+        let dir = TempDir::new().unwrap();
+        let cwd = dir.path().join("work");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let target = dir.path().join("skipped.txt");
+        assert!(!target.exists());
+
+        let profile = permission_profile_with_entries(vec![
+            FileSystemSandboxEntry::new(
+                FileSystemPath::Special {
+                    value: FileSystemSpecialPath::Root,
+                },
+                FileSystemAccessMode::Read,
+            ),
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Path {
+                    path: AbsolutePathBuf::from_absolute_path(&target).unwrap().into(),
+                },
+                access: FileSystemAccessMode::Write,
+                missing_path_behavior: Some(
+                    codex_protocol::permissions::FileSystemSandboxEntryMissingPathBehavior::Skip,
+                ),
+            },
+        ]);
+        let permissions =
+            ResolvedWindowsSandboxPermissions::try_from_permission_profile(&profile).unwrap();
+        let candidates = permissions.explicit_missing_write_target_candidates(&cwd);
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn candidates_excludes_descendant_directory_roots() {
+        let dir = TempDir::new().unwrap();
+        let cwd = dir.path().join("work");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let dir_target = dir.path().join("new_dir");
+        let child_target = dir_target.join(".git");
+
+        let profile = permission_profile_with_entries(vec![
+            FileSystemSandboxEntry::new(
+                FileSystemPath::Special {
+                    value: FileSystemSpecialPath::Root,
+                },
+                FileSystemAccessMode::Read,
+            ),
+            FileSystemSandboxEntry::new(
+                FileSystemPath::Path {
+                    path: AbsolutePathBuf::from_absolute_path(&dir_target)
+                        .unwrap()
+                        .into(),
+                },
+                FileSystemAccessMode::Write,
+            ),
+            FileSystemSandboxEntry::new(
+                FileSystemPath::Path {
+                    path: AbsolutePathBuf::from_absolute_path(&child_target)
+                        .unwrap()
+                        .into(),
+                },
+                FileSystemAccessMode::Deny,
+            ),
+        ]);
+        let permissions =
+            ResolvedWindowsSandboxPermissions::try_from_permission_profile(&profile).unwrap();
+        let candidates = permissions.explicit_missing_write_target_candidates(&cwd);
+        assert!(
+            candidates.is_empty(),
+            "directory root with descendants must be excluded"
+        );
+    }
+
+    #[test]
+    fn candidates_excludes_read_deny_matcher_globs() {
+        let dir = TempDir::new().unwrap();
+        let cwd = dir.path().join("work");
+        std::fs::create_dir_all(&cwd).unwrap();
+        // Relative deny globs are anchored at cwd, so the target must live under it.
+        let target = cwd.join("secret.env");
+
+        let profile = permission_profile_with_entries(vec![
+            FileSystemSandboxEntry::new(
+                FileSystemPath::Special {
+                    value: FileSystemSpecialPath::Root,
+                },
+                FileSystemAccessMode::Read,
+            ),
+            FileSystemSandboxEntry::new(
+                FileSystemPath::Path {
+                    path: AbsolutePathBuf::from_absolute_path(&target).unwrap().into(),
+                },
+                FileSystemAccessMode::Write,
+            ),
+            FileSystemSandboxEntry::new(
+                FileSystemPath::GlobPattern {
+                    pattern: "**/*.env".to_string(),
+                },
+                FileSystemAccessMode::Deny,
+            ),
+        ]);
+        let permissions =
+            ResolvedWindowsSandboxPermissions::try_from_permission_profile(&profile).unwrap();
+        let candidates = permissions.explicit_missing_write_target_candidates(&cwd);
+        assert!(
+            candidates.is_empty(),
+            "deny glob matching file must be excluded"
+        );
+    }
+
+    fn path_entry(path: &Path, access: FileSystemAccessMode) -> FileSystemSandboxEntry {
+        FileSystemSandboxEntry::new(
+            FileSystemPath::Path {
+                path: AbsolutePathBuf::from_absolute_path(path).unwrap().into(),
+            },
+            access,
+        )
+    }
+
+    fn root_read_entry() -> FileSystemSandboxEntry {
+        FileSystemSandboxEntry::new(
+            FileSystemPath::Special {
+                value: FileSystemSpecialPath::Root,
+            },
+            FileSystemAccessMode::Read,
+        )
+    }
+
+    #[test]
+    fn candidates_detect_descendants_case_insensitively() {
+        // A child carveout spelled with different case still marks the missing
+        // grant as a directory root, so it must not become a file placeholder.
+        let dir = TempDir::new().unwrap();
+        let cwd = dir.path().join("work");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let new_dir = dir.path().join("new_dir");
+        let upper_child =
+            PathBuf::from(new_dir.join(".git").to_string_lossy().to_ascii_uppercase());
+
+        let profile = permission_profile_with_entries(vec![
+            root_read_entry(),
+            path_entry(&new_dir, FileSystemAccessMode::Write),
+            path_entry(&upper_child, FileSystemAccessMode::Deny),
+        ]);
+        let permissions =
+            ResolvedWindowsSandboxPermissions::try_from_permission_profile(&profile).unwrap();
+
+        assert!(
+            permissions
+                .explicit_missing_write_target_candidates(&cwd)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn candidates_do_not_treat_prefix_siblings_as_descendants() {
+        let dir = TempDir::new().unwrap();
+        let cwd = dir.path().join("work");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let protected = dir.path().join("protected");
+        let sibling_child = dir.path().join("protected-old").join("ok.txt");
+
+        let profile = permission_profile_with_entries(vec![
+            root_read_entry(),
+            path_entry(&protected, FileSystemAccessMode::Write),
+            path_entry(&sibling_child, FileSystemAccessMode::Write),
+        ]);
+        let permissions =
+            ResolvedWindowsSandboxPermissions::try_from_permission_profile(&profile).unwrap();
+
+        assert_eq!(
+            permissions.explicit_missing_write_target_candidates(&cwd),
+            vec![protected, sibling_child]
         );
     }
 }

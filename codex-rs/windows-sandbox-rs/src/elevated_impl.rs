@@ -140,6 +140,25 @@ mod windows_impl {
 
         let logs_base_dir: Option<&Path> = Some(sandbox_base.as_path());
         log_start(&command, logs_base_dir);
+        // Same roots the capability SIDs below are minted for.
+        let mut placeholder_guard =
+            crate::spawn_prep::materialize_missing_write_target_placeholders(
+                &permissions,
+                cwd,
+                &env_map,
+                codex_home,
+                &deny_write_paths_override,
+                logs_base_dir,
+                || {
+                    effective_write_roots_for_permissions(
+                        &permissions,
+                        cwd,
+                        &env_map,
+                        codex_home,
+                        write_roots_override,
+                    )
+                },
+            );
         let sandbox_creds = require_logon_sandbox_creds(
             &permissions,
             cwd,
@@ -244,6 +263,7 @@ mod windows_impl {
                     )
                 },
             )?;
+            placeholder_guard.commit();
             let (pipe_write, mut pipe_read) = transport.into_files();
             let cancel_writer = spawn_cancel_writer(&pipe_write, cancellation)?;
 

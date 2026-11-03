@@ -343,13 +343,18 @@ pub(crate) async fn spawn_windows_sandbox_session_legacy(
     stdin_open: bool,
     private_desktop_name: Option<String>,
 ) -> Result<SpawnedProcess> {
-    let common = prepare_legacy_spawn_context(
+    let additional_deny_write_paths = additional_deny_write_paths
+        .iter()
+        .map(AbsolutePathBuf::to_path_buf)
+        .collect::<Vec<_>>();
+    let mut common = prepare_legacy_spawn_context(
         permission_profile,
         workspace_roots,
         codex_home,
         cwd,
         &mut env_map,
         &command,
+        &additional_deny_write_paths,
         SpawnPrepOptions {
             inherit_path: false,
             add_git_safe_directory: false,
@@ -363,10 +368,6 @@ pub(crate) async fn spawn_windows_sandbox_session_legacy(
     if !additional_deny_read_paths.is_empty() {
         anyhow::bail!("deny-read overrides require the elevated Windows sandbox backend");
     }
-    let additional_deny_write_paths = additional_deny_write_paths
-        .iter()
-        .map(AbsolutePathBuf::to_path_buf)
-        .collect::<Vec<_>>();
     let capability_roots = legacy_session_capability_roots(
         &common.permissions,
         &common.current_dir,
@@ -436,6 +437,7 @@ pub(crate) async fn spawn_windows_sandbox_session_legacy(
             return Err(err);
         }
     };
+    common.placeholder_guard.commit();
     let hpc_handle = hpc.map(|hpc| Arc::new(StdMutex::new(Some(hpc))));
 
     let process_handle = Arc::new(StdMutex::new(Some(NonOwningProcessHandle(pi.hProcess))));
