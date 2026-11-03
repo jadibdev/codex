@@ -932,6 +932,7 @@ fn latest_session_lookup_params(
     lookup_mode: LatestSessionLookupMode,
 ) -> ThreadListParams {
     ThreadListParams {
+        current_account_only: true,
         excluded_thread_ids: None,
         attached_to_thread_id: None,
         originators: None,
@@ -981,6 +982,18 @@ fn uses_remote_workspace_or_environment(
         || environment_manager
             .default_environment()
             .is_some_and(|environment| environment.is_remote())
+}
+
+fn backend_preference_local_cwd(
+    config_cwd: &Path,
+    app_server_target: &AppServerTarget,
+    environment_manager: &EnvironmentManager,
+) -> Option<PathBuf> {
+    if uses_remote_workspace_or_environment(app_server_target, environment_manager) {
+        std::env::current_dir().ok()
+    } else {
+        Some(config_cwd.to_path_buf())
+    }
 }
 
 #[expect(
@@ -1230,10 +1243,19 @@ async fn run_ratatui_app(
     daemon_startup_warning: Option<String>,
     managed_daemon: bool,
     launch_telemetry: daemon_telemetry::Launch<
-        impl FnOnce(&AppServerTarget, bool) -> terminal_size_telemetry::LaunchTags,
+        impl FnOnce(&'static str) -> terminal_size_telemetry::LaunchTags,
     >,
     startup_draft: startup_draft::StartupDraft,
 ) -> color_eyre::Result<AppExitInfo> {
+    // Capture host credentials and project inputs before resume/fork reloads executor config.
+    let backend_preference_context = app::backend_selection::BackendPreferenceContext::new(
+        &initial_config,
+        backend_preference_local_cwd(
+            initial_config.cwd.as_path(),
+            &app_server_target,
+            &environment_manager,
+        ),
+    );
     let backend_id = crate::backend_id::BackendId::new();
     let uses_remote_workspace = app_server_target.uses_remote_workspace();
     let workload_identity_selected = is_workload_identity_selected();
@@ -1264,6 +1286,7 @@ async fn run_ratatui_app(
                 UpdatePromptOutcome::Continue => {}
                 UpdatePromptOutcome::RunUpdate(action) => {
                     terminal_restore_guard.restore()?;
+                    launch_telemetry.record("update_requested");
                     return Ok(AppExitInfo {
                         token_usage: crate::token_usage::TokenUsage::default(),
                         thread_id: None,
@@ -1299,15 +1322,20 @@ async fn run_ratatui_app(
             ),
         )
         .await;
-    tui.terminal_size_tags =
-        launch_telemetry.record(&app_server_target, matches!(&startup_app_server, Ok(Ok(_))));
     let mut app_server_session = match startup_app_server {
-        Ok(Ok(app_server)) => AppServerSession::new(
-            backend_id,
-            app_server,
-            app_server_target.thread_params_mode(),
-        )
-        .with_local_codex_home(&initial_config.codex_home),
+        Ok(Ok(app_server)) => {
+            tui.terminal_size_tags = launch_telemetry.record(match &app_server_target {
+                AppServerTarget::Embedded => "in_process",
+                AppServerTarget::LocalDaemon { .. } => "local_daemon",
+                AppServerTarget::Remote { .. } => "remote",
+            });
+            AppServerSession::new(
+                backend_id,
+                app_server,
+                app_server_target.thread_params_mode(),
+            )
+            .with_local_codex_home(&initial_config.codex_home)
+        }
         Ok(Err(err)) => {
             terminal_restore_guard.restore_silently();
             session_log::log_session_end();
@@ -1871,8 +1899,7 @@ async fn run_ratatui_app(
     if config.model_provider_id != startup_model_provider {
         startup_account = None;
         if matches!(&app_server_target, AppServerTarget::Embedded) {
-            // App-server providers are fixed at startup, so onboarding cannot
-            // reuse a server initialized before it persisted another provider.
+            // Rebuild the embedded server with the final local configuration.
             shutdown_app_server_if_present(app_server.take()).await;
         }
     }
@@ -2214,6 +2241,7 @@ async fn run_ratatui_app(
         crate::app::backend_sessions::InitialBackendSessions::singleton(app_server),
         config,
         current_cwd.to_path_buf(),
+        backend_preference_context,
         cli_kv_overrides.clone(),
         overrides.clone(),
         loader_overrides.clone(),
@@ -2491,7 +2519,12 @@ fn should_show_provider_setup_wizard(
     app_server_target: &AppServerTarget,
     feature: Feature,
 ) -> bool {
-    matches!(app_server_target, AppServerTarget::Embedded)
+    let supported_target = match app_server_target {
+        AppServerTarget::Embedded => true,
+        AppServerTarget::LocalDaemon { .. } => feature == Feature::BedrockSetupWizard,
+        AppServerTarget::Remote { .. } => false,
+    };
+    supported_target
         && should_show_login_screen(login_status, requires_openai_auth)
         && config.features.enabled(feature)
         && config.model_provider_id == "openai"

@@ -76,7 +76,11 @@ impl ChatWidget {
             &header_model,
             &model_catalog.try_list_models().unwrap_or_default(),
         );
-        let runtime_keymap = RuntimeKeymap::from_config(&local_settings.tui.keymap).ok();
+        let runtime_keymap = RuntimeKeymap::for_session(
+            &local_settings.tui.keymap,
+            local_settings.workspace_enabled(&config),
+        )
+        .ok();
         let default_keymap = RuntimeKeymap::defaults();
         let copy_last_response_binding = runtime_keymap
             .as_ref()
@@ -260,6 +264,7 @@ impl ChatWidget {
             suppress_initial_user_message_submit: false,
             pending_notification: None,
             quit_shortcut_expires_at: None,
+            new_backend_label: None,
             quick_dial_menu: false,
             quick_dial_menu_key_guard: None,
             quit_shortcut_key: None,

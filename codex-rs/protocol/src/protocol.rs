@@ -222,6 +222,15 @@ pub struct ConversationStartParams {
     pub voice: Option<RealtimeVoice>,
 }
 
+/// A caller-owned realtime sideband. Dropping either direction seals input and ends
+/// the attachment after accepted messages drain. The caller supplies bounded channels
+/// and one complete JSON message per item.
+#[derive(Debug)]
+pub struct RealtimeSidebandTransport {
+    pub incoming: tokio::sync::mpsc::Receiver<String>,
+    pub outgoing: tokio::sync::mpsc::Sender<String>,
+}
+
 impl fmt::Debug for ConversationStartParams {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Text, instructions, and transport endpoints can contain credentials.
@@ -720,6 +729,13 @@ pub enum Op {
         reply: oneshot::Sender<CodexResult<()>>,
     },
 
+    /// Attach an existing call using caller-provided I/O without opening a socket.
+    RealtimeConversationAttachStream {
+        params: ConversationStartParams,
+        transport: RealtimeSidebandTransport,
+        reply: oneshot::Sender<CodexResult<()>>,
+    },
+
     /// Send audio input to the running realtime conversation stream.
     #[debug("RealtimeConversationAudio {{ item_id: {:?}, sample_rate: {}, num_channels: {}, samples_per_channel: {:?} }}", _0.frame.item_id, _0.frame.sample_rate, _0.frame.num_channels, _0.frame.samples_per_channel)]
     RealtimeConversationAudio(ConversationAudioParams),
@@ -1094,6 +1110,7 @@ impl Op {
             Self::CleanBackgroundTerminals => "clean_background_terminals",
             Self::RealtimeConversationStart(_) => "realtime_conversation_start",
             Self::RealtimeConversationAttach { .. } => "realtime_conversation_attach",
+            Self::RealtimeConversationAttachStream { .. } => "realtime_conversation_attach_stream",
             Self::RealtimeConversationAudio(_) => "realtime_conversation_audio",
             Self::RealtimeConversationText(_) => "realtime_conversation_text",
             Self::RealtimeConversationSpeech(_) => "realtime_conversation_speech",
@@ -1170,8 +1187,9 @@ pub enum AskForApproval {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema, TS)]
 pub struct GranularApprovalConfig {
-    /// Whether to allow shell command approval requests, including inline
+    /// Whether to allow sandbox escalation approval requests, including inline
     /// `with_additional_permissions` and `require_escalated` requests.
+    /// Dangerous commands can still request approval within existing permissions.
     pub sandbox_approval: bool,
     /// Whether to allow prompts triggered by execpolicy `prompt` rules.
     pub rules: bool,
@@ -2177,6 +2195,11 @@ pub struct ItemCompletedEvent {
     pub thread_id: ThreadId,
     pub turn_id: String,
     pub item: TurnItem,
+    /// Native tokens in the completed assistant message, including any sampled footer.
+    /// Completion telemetry only; absent for items without a producer-supplied count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub content_token_count: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub started_at_ms: Option<i64>,
@@ -3416,6 +3439,9 @@ pub struct HistoryPosition {
 /// and should be used when there is no config override.
 #[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, TS)]
 pub struct SessionMeta {
+    /// Scope discovery to the creator. Absent on threads created before account filtering.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub account_scoped: bool,
     /// ChatGPT user that created this thread; absent when unavailable or for older threads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub creator_user_id: Option<String>,
@@ -3499,6 +3525,7 @@ impl Default for SessionMeta {
     fn default() -> Self {
         let id = ThreadId::default();
         SessionMeta {
+            account_scoped: false,
             creator_user_id: None,
             creator_account_id: None,
             session_id: id.into(),
@@ -5742,6 +5769,7 @@ mod tests {
     #[test]
     fn item_completed_event_from_image_generation_emits_end_event() {
         let event = ItemCompletedEvent {
+            content_token_count: None,
             thread_id: ThreadId::new(),
             turn_id: "turn-1".into(),
             item: TurnItem::ImageGeneration(ImageGenerationItem {
@@ -5780,6 +5808,7 @@ mod tests {
     #[test]
     fn item_completed_event_from_file_change_emits_patch_end_event() {
         let event = ItemCompletedEvent {
+            content_token_count: None,
             thread_id: ThreadId::new(),
             turn_id: "turn-1".into(),
             started_at_ms: Some(0),
@@ -5819,6 +5848,7 @@ mod tests {
     #[test]
     fn item_completed_event_from_mcp_tool_call_emits_end_event() {
         let event = ItemCompletedEvent {
+            content_token_count: None,
             thread_id: ThreadId::new(),
             turn_id: "turn-1".into(),
             started_at_ms: Some(0),
@@ -5900,6 +5930,7 @@ mod tests {
             }),
         };
         let completed = ItemCompletedEvent {
+            content_token_count: None,
             thread_id: ThreadId::new(),
             turn_id: "turn-1".into(),
             started_at_ms: Some(10),
@@ -5978,6 +6009,7 @@ mod tests {
             }),
         };
         let completed = ItemCompletedEvent {
+            content_token_count: None,
             thread_id: ThreadId::new(),
             turn_id: "turn-1".into(),
             started_at_ms: Some(10),
@@ -6023,6 +6055,7 @@ mod tests {
     #[test]
     fn review_mode_item_completion_emits_legacy_events_with_ids() {
         let entered = ItemCompletedEvent {
+            content_token_count: None,
             thread_id: ThreadId::new(),
             turn_id: "turn-1".into(),
             started_at_ms: Some(0),
@@ -6036,6 +6069,7 @@ mod tests {
             }),
         };
         let exited = ItemCompletedEvent {
+            content_token_count: None,
             thread_id: ThreadId::new(),
             turn_id: "turn-1".into(),
             started_at_ms: Some(0),
@@ -6096,6 +6130,7 @@ mod tests {
     #[test]
     fn item_completed_event_defaults_missing_completed_at_ms() {
         let mut value = serde_json::to_value(ItemCompletedEvent {
+            content_token_count: None,
             thread_id: ThreadId::new(),
             turn_id: "turn-1".into(),
             item: TurnItem::UserMessage(UserMessageItem::new(&[])),

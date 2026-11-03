@@ -21,6 +21,7 @@ use crate::config::RuntimeConfigRefresh;
 use crate::context::ContextualUserFragment;
 use crate::context::DeveloperInstructions;
 use crate::context::TurnAborted;
+use crate::environment_selection::EnvironmentAttachment;
 use crate::environment_selection::EnvironmentConfigOrigin;
 use crate::environment_selection::ThreadEnvironments;
 use crate::environment_selection::TurnEnvironmentState;
@@ -4661,6 +4662,7 @@ async fn set_rate_limits_retains_previous_credits() {
         app_server_client_version: None,
         trusted_guardian_reviewer: false,
         session_source: SessionSource::Exec,
+        root_capabilities_restricted: false,
         history_mode: Default::default(),
         forked_from_thread_id: None,
         parent_thread_id: None,
@@ -4784,6 +4786,7 @@ async fn set_rate_limits_updates_plan_type_when_present() {
         app_server_client_version: None,
         trusted_guardian_reviewer: false,
         session_source: SessionSource::Exec,
+        root_capabilities_restricted: false,
         history_mode: Default::default(),
         forked_from_thread_id: None,
         parent_thread_id: None,
@@ -5409,6 +5412,7 @@ pub(crate) async fn make_session_configuration_for_tests() -> SessionConfigurati
         app_server_client_version: None,
         trusted_guardian_reviewer: false,
         session_source: SessionSource::Exec,
+        root_capabilities_restricted: false,
         history_mode: Default::default(),
         forked_from_thread_id: None,
         parent_thread_id: None,
@@ -6987,6 +6991,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         app_server_client_version: None,
         trusted_guardian_reviewer: false,
         session_source: SessionSource::Exec,
+        root_capabilities_restricted: false,
         history_mode: Default::default(),
         forked_from_thread_id: None,
         parent_thread_id: None,
@@ -7003,8 +7008,10 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
     );
 
     let mut state = SessionState::new(session_configuration.clone());
-    state.history =
-        ContextManager::for_session(&session_configuration.session_source, &config.features);
+    state.history = ContextManager::for_session(
+        session_configuration.root_capabilities_restricted,
+        &config.features,
+    );
     let (environment_manager, resolved_environments) =
         resolved_environments_for_configuration(&session_configuration, &default_environments)
             .await;
@@ -7020,11 +7027,12 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         resolved_environments,
         /*non_blocking_snapshots*/ false,
     ));
+    turn_environments.activate_configured(tx_event.clone());
     let environment = Arc::clone(
-        &resolved_turn_environments
+        resolved_turn_environments
             .primary()
             .expect("primary environment")
-            .environment,
+            .environment(),
     );
     let plugins_manager = Arc::new(plugins_manager_for_config(
         &config,
@@ -7143,6 +7151,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
 
     let session = Session {
         thread_id,
+        agent_runtime: crate::agent::host::AgentRuntimeServices::Controller,
         installation_id: "11111111-1111-4111-8111-111111111111".to_string(),
         tx_event,
         parent_observer_event_tx: OnceLock::new(),
@@ -7308,6 +7317,7 @@ async fn make_session_with_config_and_rx(
         app_server_client_version: None,
         trusted_guardian_reviewer: false,
         session_source: SessionSource::Exec,
+        root_capabilities_restricted: false,
         history_mode: Default::default(),
         forked_from_thread_id: None,
         parent_thread_id: None,
@@ -7445,6 +7455,7 @@ async fn make_session_with_history_source_and_agent_control_and_rx(
         app_server_client_version: None,
         trusted_guardian_reviewer: false,
         session_source: session_source.clone(),
+        root_capabilities_restricted: session_source.is_non_root_agent(),
         history_mode: Default::default(),
         forked_from_thread_id: None,
         parent_thread_id: None,
@@ -7949,7 +7960,7 @@ async fn request_permissions_tool_resolves_legacy_paths_against_selected_environ
                 config: EnvironmentConfigState::Ready(current_environment_config),
             },
             current_environment.config_origin,
-            current_environment.environment,
+            Arc::clone(current_environment.environment()),
             current_environment.shell,
         )
     };
@@ -8457,11 +8468,11 @@ async fn turn_environments_set_primary_environment() {
         .primary()
         .expect("primary environment should be set");
     assert!(std::sync::Arc::ptr_eq(
-        &turn_environment.environment,
-        &turn_environments
+        turn_environment.environment(),
+        turn_environments
             .primary()
             .expect("primary environment")
-            .environment
+            .environment()
     ));
     assert!(
         turn_context
@@ -8486,17 +8497,17 @@ async fn turn_environments_set_primary_environment() {
     };
     assert!(Arc::ptr_eq(
         &stored_environment,
-        &turn_environment.environment
+        turn_environment.environment()
     ));
 
     let default_turn = session.new_default_turn().await;
     assert!(Arc::ptr_eq(
         &stored_environment,
-        &default_turn
+        default_turn
             .initial_environments
             .primary()
             .expect("default turn primary environment")
-            .environment
+            .environment()
     ));
 }
 
@@ -8575,11 +8586,11 @@ async fn task_turn_does_not_overlay_legacy_fallback_cwd_onto_stored_thread_envir
         .primary()
         .expect("primary environment should be set");
     assert!(std::sync::Arc::ptr_eq(
-        &turn_environment.environment,
-        &turn_environments
+        turn_environment.environment(),
+        turn_environments
             .primary()
             .expect("primary environment")
-            .environment
+            .environment()
     ));
     #[allow(deprecated)]
     let turn_cwd = turn_context.cwd.clone();
@@ -8651,7 +8662,7 @@ async fn primary_environment_uses_first_turn_environment() {
                 config: EnvironmentConfigState::Ready(first_environment_config),
             },
             first_environment.config_origin,
-            Arc::clone(&first_environment.environment),
+            Arc::clone(first_environment.environment()),
             /*shell*/ None,
         )));
 
@@ -9311,6 +9322,7 @@ where
         app_server_client_version: None,
         trusted_guardian_reviewer: false,
         session_source: SessionSource::Exec,
+        root_capabilities_restricted: false,
         history_mode: Default::default(),
         forked_from_thread_id: None,
         parent_thread_id: None,
@@ -9327,8 +9339,10 @@ where
     );
 
     let mut state = SessionState::new(session_configuration.clone());
-    state.history =
-        ContextManager::for_session(&session_configuration.session_source, &config.features);
+    state.history = ContextManager::for_session(
+        session_configuration.root_capabilities_restricted,
+        &config.features,
+    );
     let (environment_manager, resolved_turn_environments) =
         resolved_environments_for_configuration(&session_configuration, &default_environments)
             .await;
@@ -9343,11 +9357,12 @@ where
         resolved_turn_environments.clone(),
         /*non_blocking_snapshots*/ false,
     ));
+    turn_environments.activate_configured(tx_event.clone());
     let environment = Arc::clone(
-        &resolved_turn_environments
+        resolved_turn_environments
             .primary()
             .expect("primary environment")
-            .environment,
+            .environment(),
     );
     let plugins_manager = Arc::new(plugins_manager_for_config(
         &config,
@@ -9466,6 +9481,7 @@ where
 
     let session = Arc::new(Session {
         thread_id,
+        agent_runtime: crate::agent::host::AgentRuntimeServices::Controller,
         installation_id: "11111111-1111-4111-8111-111111111111".to_string(),
         tx_event,
         parent_observer_event_tx: OnceLock::new(),
@@ -10617,7 +10633,7 @@ async fn record_context_updates_emits_environment_item_for_cwd_changes() {
         .clone();
     let environment_config = environment.config().clone();
     current_context.initial_environments.environments[0] =
-        TurnEnvironmentState::Ready(TurnEnvironment::new(
+        TurnEnvironmentState::Ready(TurnEnvironment::from_attachment(
             TurnEnvironmentSelection {
                 selected_capability_roots: Default::default(),
                 environment_id: environment.selection.environment_id,
@@ -10626,7 +10642,7 @@ async fn record_context_updates_emits_environment_item_for_cwd_changes() {
                 config: EnvironmentConfigState::Ready(environment_config),
             },
             environment.config_origin,
-            environment.environment,
+            environment.attachment,
             environment.shell,
         ));
 
@@ -10684,7 +10700,7 @@ async fn record_context_updates_use_environment_permission_profile_and_workspace
     environment_config.permission_profile =
         PermissionProfileSnapshot::legacy(PermissionProfile::workspace_write());
     current_context.initial_environments.environments[0] =
-        TurnEnvironmentState::Ready(TurnEnvironment::new(
+        TurnEnvironmentState::Ready(TurnEnvironment::from_attachment(
             TurnEnvironmentSelection {
                 selected_capability_roots: Default::default(),
                 environment_id: environment.selection.environment_id,
@@ -10693,7 +10709,7 @@ async fn record_context_updates_use_environment_permission_profile_and_workspace
                 config: EnvironmentConfigState::Ready(environment_config),
             },
             environment.config_origin,
-            environment.environment,
+            environment.attachment,
             environment.shell,
         ));
 
@@ -10764,7 +10780,7 @@ async fn record_context_updates_omits_environment_item_when_disabled() {
         .clone();
     let environment_config = environment.config().clone();
     current_context.initial_environments.environments[0] =
-        TurnEnvironmentState::Ready(TurnEnvironment::new(
+        TurnEnvironmentState::Ready(TurnEnvironment::from_attachment(
             TurnEnvironmentSelection {
                 selected_capability_roots: Default::default(),
                 environment_id: environment.selection.environment_id,
@@ -10773,7 +10789,7 @@ async fn record_context_updates_omits_environment_item_when_disabled() {
                 config: EnvironmentConfigState::Ready(environment_config),
             },
             environment.config_origin,
-            environment.environment,
+            environment.attachment,
             environment.shell,
         ));
 
@@ -11340,7 +11356,7 @@ async fn turn_context_item_stores_local_cwd() {
                 config: EnvironmentConfigState::Ready(environment_config),
             },
             environment.config_origin,
-            environment.environment,
+            Arc::clone(environment.environment()),
             environment.shell,
         ));
 

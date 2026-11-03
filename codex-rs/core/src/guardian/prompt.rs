@@ -1,11 +1,7 @@
 use codex_extension_api::ConversationHistorySnapshot;
 use codex_features::Feature;
-#[cfg(test)]
-use codex_guardian_context::Budgeted;
 use codex_guardian_context::CollectedContext;
 use codex_guardian_context::ContextProfile;
-#[cfg(test)]
-use codex_guardian_context::ConversationTranscriptEntry;
 use codex_guardian_context::GuardianRootMessage;
 use codex_guardian_context::PlannedAction;
 use codex_guardian_context::SectionError;
@@ -32,8 +28,6 @@ use super::GUARDIAN_MAX_TOOL_ENTRY_TOKENS;
 use super::GuardianApprovalRequest;
 use super::GuardianReviewContext;
 
-// Bound both JSON and permission evidence without restricting manual approvals.
-const MAX_GUARDIAN_ENVIRONMENT_ID_BYTES: usize = 256;
 pub(super) use codex_guardian_reviewer::GUARDIAN_TRANSCRIPT_START;
 
 /// Selects transcript evidence using the checkpoint already loaded by the reviewer.
@@ -103,12 +97,7 @@ pub(super) async fn collect_guardian_prompt_items_with_parent_turn(
         GuardianTranscriptHistory::Retained(history) => (history, false),
         GuardianTranscriptHistory::LoadedParentCheckpoint(history) => (history, true),
     };
-    if request
-        .target_environment_id()
-        .is_some_and(|id| id.len() > MAX_GUARDIAN_ENVIRONMENT_ID_BYTES)
-    {
-        anyhow::bail!("approval environment id exceeds Guardian's 256-byte limit");
-    }
+    super::permissions::check_environment_id(request.target_environment_id())?;
     let evidence_mode = parent_context
         .map(|context| node_repl_review_evidence_mode(context.turn()))
         .unwrap_or(NodeReplReviewEvidenceMode::Disabled);
@@ -133,11 +122,20 @@ pub(super) async fn collect_guardian_prompt_items_with_parent_turn(
         &request,
         reasons.retry.or(reasons.approval),
     )?;
-    let permissions = parent_context
-        .map(|context| {
-            super::permissions::for_environment(context, request.target_environment_id())
-        })
-        .transpose()?;
+    let permissions = match request {
+        GuardianApprovalRequest::McpToolCall {
+            prompt_permissions: Some((environment_id, sandbox)),
+            ..
+        } => Some(super::permissions::for_mcp_environment(
+            &environment_id,
+            &sandbox,
+        )?),
+        _ => parent_context
+            .map(|context| {
+                super::permissions::for_environment(context, request.target_environment_id())
+            })
+            .transpose()?,
+    };
     let node_repl_snapshot = if node_repl_transcripts_enabled {
         session
             .services
@@ -201,39 +199,6 @@ pub(super) async fn collect_guardian_prompt_items_with_parent_turn(
         session_id: session.thread_id.to_string(),
         node_repl_evidence_sequence,
     })
-}
-
-/// Exercises the sync profile through the host's existing transcript tests.
-#[cfg(test)]
-pub(crate) fn render_guardian_transcript_entries(
-    entries: &[ConversationTranscriptEntry],
-    node_repl_result_token_limit: usize,
-) -> (Vec<String>, Option<String>) {
-    let mut profile = ContextProfile::synchronous();
-    profile.transcript.entry_limits.node_repl_output_tokens = node_repl_result_token_limit;
-    let mut transcript = profile.prepare_transcript(entries, /*entry_number_offset*/ 0);
-    if entries.is_empty() {
-        transcript.items.push(Budgeted::required(
-            codex_guardian_context::TranscriptContent::Text(
-                "<no retained transcript entries>".to_owned(),
-            ),
-        ));
-    }
-    (
-        transcript
-            .items
-            .into_iter()
-            .map(|item| match item.content {
-                codex_guardian_context::TranscriptContent::Text(text) => text,
-                codex_guardian_context::TranscriptContent::Record(record) => record.to_string(),
-                codex_guardian_context::TranscriptContent::ScheduledMessage(_)
-                | codex_guardian_context::TranscriptContent::NativeMessage(_) => {
-                    panic!("expected text transcript")
-                }
-            })
-            .collect(),
-        transcript.omission_note,
-    )
 }
 
 /// Retains the human-readable conversation plus recent tool call / result

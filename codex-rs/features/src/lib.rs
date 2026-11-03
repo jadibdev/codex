@@ -105,6 +105,8 @@ pub enum Feature {
     ApiKeyCyberAccessPrograms,
     /// Enable Daybreak controls and automatic access-program selection in CLI clients.
     CliDaybreak,
+    /// Restrict CLI resume of attributed local threads to their creator.
+    CliResumeAccountCheck,
     /// Removed no-op; use `tui.fullscreen_transcript` instead.
     TranscriptV2,
     // Stable.
@@ -119,10 +121,12 @@ pub enum Feature {
     /// Store CLI auth in the encrypted local secrets backend when keyring storage is selected.
     SecretAuthStorage,
 
-    /// Automatically start the shared local daemon for eligible interactive launches.
+    /// Removed compatibility flag. Eligible interactive launches always start or reuse the daemon.
     DaemonAutoStart,
     /// Allow the TUI to discover and select among multiple conversation backends.
     TuiMultiBackend,
+    /// Enable workspace behavior for side conversations in the owned TUI.
+    TuiWorkspace,
     /// Render the configured status line through the experimental TUI Extensions renderer.
     TuiExtensionsStatusLine,
     /// Enable negotiated zstd compression for app-server WebSocket and UDS connections.
@@ -192,6 +196,8 @@ pub enum Feature {
     WebSearchCached,
     /// Expose the extension-backed standalone web search tool.
     StandaloneWebSearch,
+    /// Let the host authorize MCP search independently of native search through per-turn policy.
+    HostedSearchPolicy,
     /// Use the legacy Landlock Linux sandbox fallback instead of the default
     /// bubblewrap pipeline.
     UseLegacyLandlock,
@@ -261,6 +267,8 @@ pub enum Feature {
     InterruptOnCancel,
     /// Enable shared discussion tools for an agent tree.
     AgentMessageBoard,
+    /// Expose a tree-scoped in-memory message board through HTTP MCP.
+    AgentMessageBoardMcp,
     /// Removed compatibility flag retained as a no-op.
     MultiAgentMode,
     /// Removed compatibility flag for the deleted agent-job tools.
@@ -376,6 +384,8 @@ pub enum Feature {
     ExternalMigration,
     /// Enable extension-backed image generation.
     ImageGeneration,
+    /// Allow the image-generation tool to request a backend-assembled GIF.
+    ImageGenerationAnimation,
     /// Omit inline image and audio content from app-server item notifications.
     OmitAppServerNotificationMedia,
     /// Tell the model when a prompt image was resized and include its dimensions.
@@ -429,6 +439,8 @@ pub enum Feature {
     GuardianTrustOrchestratorConnectors,
     /// Give Guardian access to the root conversation's message history tools.
     GuardianConversationHistoryTools,
+    /// Reconsider a synchronous Guardian denial once before publishing it.
+    GuardianDenialReconsideration,
     /// Enable Guardian V2 automatic approval reviews.
     GuardianV2,
     /// Run Decisions alongside Guardian V2 for measurement without changing approvals.
@@ -624,6 +636,11 @@ impl Features {
         self.enabled.contains(&f)
     }
 
+    /// Whether to advertise GIF output in the image-generation tool.
+    pub fn image_generation_animation_enabled(&self) -> bool {
+        self.enabled(Feature::ImageGenerationAnimation)
+    }
+
     /// Whether a routing tier is enabled, independently of model catalog support.
     pub fn service_tier_enabled(&self, service_tier: &str) -> bool {
         match service_tier {
@@ -715,6 +732,13 @@ impl Features {
                     self.record_legacy_usage_force(
                         "unified_exec_zsh_fork",
                         Feature::UnifiedExecZshFork,
+                    );
+                    continue;
+                }
+                "daemon_auto_start" => {
+                    self.record_legacy_usage_force(
+                        "features.daemon_auto_start",
+                        Feature::DaemonAutoStart,
                     );
                     continue;
                 }
@@ -840,6 +864,10 @@ fn legacy_usage_notice(alias: &str, feature: Feature) -> (String, Option<String>
         Feature::GuardianThreadContext => (
             "`[features.guardianv2].thread_context` is deprecated and ignored.".to_string(),
             Some("Thread-owned Guardian context is always enabled. Remove `thread_context` from [features.guardianv2] in config.toml, including profile overrides.".to_string()),
+        ),
+        Feature::DaemonAutoStart => (
+            "`[features].daemon_auto_start` is deprecated and ignored.".to_string(),
+            Some("Remove `daemon_auto_start` from [features] in config.toml or profile configuration files. Use `--no-daemon` to run without the shared background server.".to_string()),
         ),
         Feature::TranscriptV2 => (
             "`[features].transcript_v2` is deprecated and ignored.".to_string(),
@@ -1097,10 +1125,22 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: false,
     },
     FeatureSpec {
+        id: Feature::CliResumeAccountCheck,
+        key: "cli_resume_account_check",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
         id: Feature::DaemonAutoStart,
         key: "daemon_auto_start",
-        stage: Stage::Stable,
+        stage: Stage::Removed,
         default_enabled: true,
+    },
+    FeatureSpec {
+        id: Feature::TuiWorkspace,
+        key: "tui_workspace",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
     },
     FeatureSpec {
         id: Feature::TuiMultiBackend,
@@ -1362,6 +1402,12 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::StandaloneWebSearch,
         key: "standalone_web_search",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::HostedSearchPolicy,
+        key: "hosted_search_policy",
         stage: Stage::UnderDevelopment,
         default_enabled: false,
     },
@@ -1644,6 +1690,12 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: false,
     },
     FeatureSpec {
+        id: Feature::AgentMessageBoardMcp,
+        key: "agent_message_board_mcp",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
         id: Feature::MultiAgentMode,
         key: "multi_agent_mode",
         stage: Stage::Removed,
@@ -1920,6 +1972,12 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: true,
     },
     FeatureSpec {
+        id: Feature::ImageGenerationAnimation,
+        key: "image_generation_animation",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
         id: Feature::OmitAppServerNotificationMedia,
         key: "omit_app_server_notification_media",
         stage: Stage::UnderDevelopment,
@@ -2084,6 +2142,12 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::GuardianConversationHistoryTools,
         key: "guardian_conversation_history_tools",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::GuardianDenialReconsideration,
+        key: "guardian_denial_reconsideration",
         stage: Stage::UnderDevelopment,
         default_enabled: false,
     },
@@ -2300,8 +2364,8 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::RetainClientToolOutputs,
         key: "retain_client_tool_outputs",
-        stage: Stage::UnderDevelopment,
-        default_enabled: false,
+        stage: Stage::Stable,
+        default_enabled: true,
     },
     FeatureSpec {
         id: Feature::UseAgentIdentity,

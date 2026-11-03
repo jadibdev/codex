@@ -272,6 +272,7 @@ pub(crate) use chat_composer::InputResult;
 pub(crate) use chat_composer::KillBufferSnapshot;
 pub(crate) use chat_composer::QueuedInputAction;
 pub(crate) use chat_composer::RestrictedInputMode;
+pub(crate) use chat_composer::ShellPrefixHandling;
 pub(crate) use chat_composer_history::HistoryEntry;
 
 use crate::status_indicator_widget::StatusDetailsCapitalization;
@@ -566,6 +567,10 @@ impl BottomPane {
     /// Slash recall records the submitted command text regardless of whether the command succeeds.
     pub(crate) fn record_pending_slash_command_history(&mut self) {
         self.composer.record_pending_slash_command_history();
+    }
+
+    pub(super) fn keymap(&self) -> &RuntimeKeymap {
+        &self.keymap
     }
 
     /// Replace all bottom-pane keymap caches from one resolved runtime keymap.
@@ -944,21 +949,19 @@ impl BottomPane {
                 let view = &mut self.view_stack[last_index];
                 let prefer_esc =
                     key_event.code == KeyCode::Esc && view.prefer_esc_to_handle_key_event();
-                let ctrl_c_completed = key_event.code == KeyCode::Esc
+                let cancel_handled = key_event.code == KeyCode::Esc
                     && !prefer_esc
-                    && matches!(view.on_ctrl_c(), CancellationEvent::Handled)
-                    && view.is_complete();
-                if ctrl_c_completed {
-                    (true, true, view.completion(), false)
-                } else {
+                    && matches!(view.on_ctrl_c(), CancellationEvent::Handled);
+                if !cancel_handled {
                     view.handle_key_event_with_activation_key(key_event, activation_key);
-                    (
-                        false,
-                        view.is_complete(),
-                        view.completion(),
-                        view.is_in_paste_burst(),
-                    )
                 }
+                let complete = view.is_complete();
+                (
+                    cancel_handled && complete,
+                    complete,
+                    view.completion(),
+                    view.is_in_paste_burst(),
+                )
             };
 
             if ctrl_c_completed {
@@ -1185,13 +1188,15 @@ impl BottomPane {
         text_elements: Vec<TextElement>,
         local_image_paths: Vec<PathBuf>,
         mention_bindings: Vec<MentionBinding>,
+        shell_prefix: ShellPrefixHandling,
     ) {
         self.composer.edit_stored_draft(|composer| {
-            composer.set_text_content_with_mention_bindings(
+            composer.set_text_content_with_shell_prefix(
                 text,
                 text_elements,
                 local_image_paths,
                 mention_bindings,
+                shell_prefix,
             );
             composer.move_cursor_to_end();
         });
@@ -1378,7 +1383,6 @@ impl BottomPane {
         self.status_widget().is_some()
     }
 
-    #[cfg(test)]
     pub(crate) fn status_line_content(&self) -> Option<&footer_content::FooterContent> {
         self.composer.status_line_content()
     }

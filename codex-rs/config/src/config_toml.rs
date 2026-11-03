@@ -598,6 +598,9 @@ pub struct AutoReviewToml {
     /// Experimental replacement for the history-retrieval instructions when history tools
     /// and Apps are enabled. Omitted or blank values use the built-in prompt.
     pub experimental_conversation_history_prompt: Option<String>,
+    /// Developer message used when `features.guardian_denial_reconsideration` is enabled.
+    /// Omitted or blank values use the built-in prompt. Maximum 1,000 UTF-8 bytes.
+    pub experimental_denial_reconsideration_prompt: Option<String>,
     /// Maximum estimated tokens per Guardian history-tool response, before the standard
     /// serialization allowance. Defaults to 4,000; stricter parent tool limits still apply.
     pub conversation_history_max_output_tokens: Option<NonZeroUsize>,
@@ -706,6 +709,8 @@ pub struct RealtimeAudioToml {
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct ToolsToml {
+    /// Client provider preference when the model does not select a provider.
+    pub client_search_provider: Option<codex_protocol::openai_models::WebSearchProvider>,
     #[serde(
         default,
         deserialize_with = "deserialize_optional_web_search_tool_config"

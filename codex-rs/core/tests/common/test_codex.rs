@@ -22,13 +22,13 @@ use codex_config::CloudConfigBundleLoader;
 use codex_core::CodexThread;
 pub use codex_core::StartThreadOptions;
 use codex_core::ThreadManager;
+use codex_core::ThreadStoreBuilder;
 use codex_core::TimeProvider;
 pub use codex_core::TurnInputRequest;
 use codex_core::config::Config;
 use codex_core::resolve_installation_id;
 use codex_core::shell::Shell;
 use codex_core::shell::get_shell_by_model_provided_path;
-use codex_core::thread_store_from_config;
 use codex_core::windows_sandbox::WindowsSandboxLevelExt;
 use codex_exec_server::CreateDirectoryOptions;
 use codex_exec_server::ExecutorFileSystem;
@@ -844,10 +844,17 @@ impl TestCodexBuilder {
         environment_manager: Arc<codex_exec_server::EnvironmentManager>,
     ) -> anyhow::Result<TestCodex> {
         let state_db = codex_core::init_state_db(&config).await;
-        let thread_store = self
-            .thread_store
-            .clone()
-            .unwrap_or_else(|| thread_store_from_config(&config, state_db.clone()));
+        let thread_store = self.thread_store.clone().unwrap_or_else(|| {
+            let sqlite = config.sqlite_config().clone();
+            ThreadStoreBuilder::from_config(&config, state_db.clone())
+                .with_additional_cleanup(move |thread_ids| {
+                    let sqlite = sqlite.clone();
+                    Box::pin(async move {
+                        codex_app_server::delete_agent_message_boards(&sqlite, &thread_ids).await
+                    })
+                })
+                .build()
+        });
         let installation_id = resolve_installation_id(&config.codex_home).await?;
         let user_instructions_provider =
             self.user_instructions_provider.clone().unwrap_or_else(|| {
@@ -866,7 +873,7 @@ impl TestCodexBuilder {
             .or_else(|| codex_utils_cargo_bin::cargo_bin("codex-code-mode-host").ok());
         let thread_manager = Arc::new_cyclic(|manager| {
             let mut extensions = self.extensions.to_builder();
-            codex_core::install_agent_message_board(&mut extensions, manager.clone());
+            codex_app_server::install_agent_message_board(&mut extensions, manager.clone());
             if config.features.enabled(Feature::GuardianV2) {
                 codex_guardian_v2::install(&mut extensions, auth_manager.clone(), manager.clone());
             } else {
